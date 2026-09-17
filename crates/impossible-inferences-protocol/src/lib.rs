@@ -1,5 +1,15 @@
 //! Public JSON contracts shared by HTTP and WebSocket transports.
 
+/// Generated, versioned gRPC contract.
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+pub mod grpc {
+    tonic::include_proto!("impossible.inferences.v1");
+
+    /// Encoded service descriptors used by local reflection.
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("impossible.inferences.v1");
+}
+
 use impossible_inferences_domain::{
     CURATED_MODEL_ID, ChatMessage, ChatRole, GenerationInput, GenerationRequest,
 };

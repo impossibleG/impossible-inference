@@ -1,5 +1,8 @@
 //! Bounded HTTP control plane for Impossible Inferences.
 
+mod grpc;
+mod mcp;
+
 use std::{
     convert::Infallible,
     future::{Future, IntoFuture, poll_fn},
@@ -192,6 +195,18 @@ impl LocalInference {
             },
         }
     }
+
+    /// Serves the versioned local gRPC API on a pre-bound listener until cancellation.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the HTTP/2 server cannot run or shut down cleanly.
+    pub async fn serve_grpc(
+        self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> io::Result<()> {
+        grpc::serve(self.state.engine.clone(), listener, shutdown).await
+    }
 }
 
 impl std::fmt::Debug for LocalInference {
@@ -237,6 +252,7 @@ impl Workload for LocalInference {
             .route("/v1/completions", post(completions))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/ws", get(websocket_upgrade))
+            .route("/mcp", post(mcp::handle))
             .with_state(self.state.clone())
     }
 
@@ -647,12 +663,14 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
             "chat_completions",
             "sse",
             "websocket",
+            "grpc",
+            "mcp",
         ]
     } else {
         &[]
     };
     let pending: &[&str] = if state.engine_available {
-        &["grpc", "mcp"]
+        &[]
     } else {
         &[
             "generation_engine",
@@ -681,7 +699,7 @@ async fn local_status(State(state): State<TransportState>) -> Json<serde_json::V
         "model": status.model,
         "profile": status.profile,
         "ready": status.ready,
-        "public_generation_transports": ["http", "sse", "websocket"]
+        "public_generation_transports": ["http", "sse", "websocket", "grpc", "mcp"]
     }))
 }
 
@@ -1452,6 +1470,11 @@ mod tests {
         TokenUsage,
     };
     use impossible_inferences_engine::{EngineError, EngineStatus};
+    use impossible_inferences_protocol::grpc::{
+        ChatMessage as GrpcChatMessage, ChatRequest as GrpcChatRequest,
+        CompletionRequest as GrpcCompletionRequest, Sampling,
+        generation_event::Payload as GrpcPayload, inference_service_client::InferenceServiceClient,
+    };
     use impossible_server_core::{CancellationToken, RequestContext, RequestStop, ServerLimits};
     use impossible_server_testkit::reserve_loopback_listener;
     use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
@@ -2187,6 +2210,234 @@ mod tests {
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(socket);
+        wait_for_fake_cancellation(&engine).await?;
+
+        let _ = shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
+        Ok(())
+    }
+
+    fn mcp_meta() -> serde_json::Value {
+        serde_json::json!({
+            "io.modelcontextprotocol/clientInfo": {"name": "contract-test", "version": "1"}
+        })
+    }
+
+    async fn mcp_request(
+        client: &reqwest::Client,
+        address: SocketAddr,
+        method: &str,
+        name: Option<&str>,
+        params: serde_json::Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut request = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params
+            }));
+        if let Some(name) = name {
+            request = request.header("mcp-name", name);
+        }
+        request.send().await
+    }
+
+    #[tokio::test]
+    async fn real_network_mcp_lists_calls_and_validates_modern_routing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, shutdown, join, _engine) =
+            spawn_transport_server(transport_limits()?).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+
+        let missing_headers = client
+            .post(format!("http://{address}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                "params": {"_meta": mcp_meta()}
+            }))
+            .send()
+            .await?;
+        assert_eq!(missing_headers.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let oversized = client
+            .post(format!("http://{address}/mcp"))
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/list")
+            .body("x".repeat(1_025))
+            .send()
+            .await?;
+        assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let listed: serde_json::Value = mcp_request(
+            &client,
+            address,
+            "tools/list",
+            None,
+            serde_json::json!({"_meta": mcp_meta()}),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(4));
+        assert_eq!(listed["result"]["ttlMs"], 60_000);
+
+        let generated: serde_json::Value = mcp_request(
+            &client,
+            address,
+            "tools/call",
+            Some("generate_text"),
+            serde_json::json!({
+                "name": "generate_text",
+                "arguments": {"model": CURATED_MODEL_ID, "prompt": "hello", "max_tokens": 8},
+                "_meta": mcp_meta()
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(generated["result"]["structuredContent"]["text"], "hello");
+        assert_eq!(
+            generated["result"]["structuredContent"]["usage"]["total_tokens"],
+            4
+        );
+
+        let resource: serde_json::Value = mcp_request(
+            &client,
+            address,
+            "resources/read",
+            Some("impossible://capabilities"),
+            serde_json::json!({
+                "uri": "impossible://capabilities",
+                "_meta": mcp_meta()
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert!(
+            resource["result"]["contents"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("grpc"))
+        );
+
+        let mismatch = mcp_request(
+            &client,
+            address,
+            "tools/call",
+            Some("chat"),
+            serde_json::json!({
+                "name": "generate_text",
+                "arguments": {"model": CURATED_MODEL_ID, "prompt": "hello"},
+                "_meta": mcp_meta()
+            }),
+        )
+        .await?;
+        assert_eq!(mismatch.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let _ = shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_network_grpc_unary_streaming_validation_and_disconnect_are_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = reserve_loopback_listener().await?;
+        let address = listener.local_addr()?;
+        let shutdown = CancellationToken::new();
+        let engine = FakeInferenceEngine::default();
+        let local = LocalInference::new(engine.clone());
+        let join = tokio::spawn(local.serve_grpc(listener, shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut client = InferenceServiceClient::connect(format!("http://{address}")).await?;
+
+        let response = client
+            .complete(GrpcCompletionRequest {
+                model: CURATED_MODEL_ID.to_owned(),
+                prompt: "hello".to_owned(),
+                sampling: Some(Sampling {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: Some(7),
+                    stop: Vec::new(),
+                }),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.usage.map(|usage| usage.total_tokens), Some(4));
+
+        let mut stream = client
+            .chat_stream(GrpcChatRequest {
+                model: CURATED_MODEL_ID.to_owned(),
+                messages: vec![GrpcChatMessage {
+                    role: impossible_inferences_protocol::grpc::ChatRole::User.into(),
+                    content: "hello".to_owned(),
+                }],
+                sampling: None,
+            })
+            .await?
+            .into_inner();
+        let mut payloads = Vec::new();
+        while let Some(event) = stream.message().await? {
+            payloads.push(event.payload.ok_or("missing gRPC event payload")?);
+        }
+        assert!(matches!(payloads.first(), Some(GrpcPayload::Delta(value)) if value == "hel"));
+        assert!(matches!(payloads.get(1), Some(GrpcPayload::Delta(value)) if value == "lo"));
+        assert!(
+            matches!(payloads.get(2), Some(GrpcPayload::Usage(value)) if value.total_tokens == 4)
+        );
+        assert!(
+            matches!(payloads.get(3), Some(GrpcPayload::FinishReason(value)) if value == "stop")
+        );
+
+        let invalid = client
+            .chat(GrpcChatRequest {
+                model: CURATED_MODEL_ID.to_owned(),
+                messages: vec![GrpcChatMessage {
+                    role: 0,
+                    content: "hello".to_owned(),
+                }],
+                sampling: None,
+            })
+            .await
+            .err()
+            .ok_or("invalid gRPC chat role was accepted")?;
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+        let mut deadline_request = tonic::Request::new(GrpcCompletionRequest {
+            model: CURATED_MODEL_ID.to_owned(),
+            prompt: "slow".to_owned(),
+            sampling: None,
+        });
+        deadline_request.set_timeout(Duration::from_millis(100));
+        let deadline = client
+            .complete(deadline_request)
+            .await
+            .err()
+            .ok_or("expired gRPC request was accepted")?;
+        assert_eq!(deadline.code(), tonic::Code::DeadlineExceeded);
+        wait_for_fake_cancellation(&engine).await?;
+        engine.observed_cancellation.store(false, Ordering::Release);
+
+        let slow = client
+            .complete_stream(GrpcCompletionRequest {
+                model: CURATED_MODEL_ID.to_owned(),
+                prompt: "slow".to_owned(),
+                sampling: None,
+            })
+            .await?
+            .into_inner();
+        drop(slow);
         wait_for_fake_cancellation(&engine).await?;
 
         let _ = shutdown.cancel();

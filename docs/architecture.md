@@ -27,5 +27,9 @@ deliberately conservative UTF-8-byte upper bound for prompt text, includes the e
 and requested output allowance, and can reject a prompt near the true tokenizer boundary. Runtime
 delta count and reported completion usage are independently checked against `max_tokens`.
 
-The public server currently adapts that engine to non-streaming HTTP, incremental SSE, and
-versioned WebSocket sessions. gRPC and MCP adapters remain pending.
+The public server adapts that engine to non-streaming HTTP, incremental SSE, versioned WebSocket
+sessions, unary and server-streaming gRPC, and stateless local MCP. The gRPC service owns a
+separate loopback HTTP/2 listener with bounded messages, standard health, reflection, deadlines,
+backpressure, and disconnect cancellation. MCP uses the stateless `2026-07-28` HTTP contract,
+validates routing headers against each JSON-RPC request, and exposes only four bounded tools and
+three privacy-safe resources.

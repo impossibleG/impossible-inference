@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
+const DEFAULT_GRPC_BIND: &str = "127.0.0.1:50051";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
@@ -72,6 +73,9 @@ struct ConfigArgs {
     /// Loopback bind address. Command-line values override environment and file values.
     #[arg(long, env = "IMPOSSIBLE_INFERENCES_BIND")]
     bind: Option<SocketAddr>,
+    /// Loopback gRPC bind address. Command-line values override environment and file values.
+    #[arg(long, env = "IMPOSSIBLE_INFERENCES_GRPC_BIND")]
+    grpc_bind: Option<SocketAddr>,
     /// Maximum encoded request body in bytes.
     #[arg(long, env = "IMPOSSIBLE_INFERENCES_MAX_REQUEST_BYTES")]
     max_request_bytes: Option<usize>,
@@ -94,6 +98,7 @@ struct ConfigArgs {
 struct FileConfig {
     artifact_root: Option<PathBuf>,
     bind: Option<SocketAddr>,
+    grpc_bind: Option<SocketAddr>,
     max_request_bytes: Option<usize>,
     queue_capacity: Option<usize>,
     max_concurrent_requests: Option<usize>,
@@ -104,6 +109,7 @@ struct FileConfig {
 #[derive(Debug, Clone)]
 struct EffectiveConfig {
     bind: SocketAddr,
+    grpc_bind: SocketAddr,
     limits: ServerLimits,
     artifact_root: PathBuf,
 }
@@ -131,6 +137,16 @@ impl ConfigArgs {
         let bind = self.bind.or(file.bind).unwrap_or(DEFAULT_BIND.parse()?);
         if !bind.ip().is_loopback() {
             return Err("v0.1 only permits loopback binding".into());
+        }
+        let grpc_bind = self
+            .grpc_bind
+            .or(file.grpc_bind)
+            .unwrap_or(DEFAULT_GRPC_BIND.parse()?);
+        if !grpc_bind.ip().is_loopback() {
+            return Err("v0.1 only permits loopback gRPC binding".into());
+        }
+        if grpc_bind == bind {
+            return Err("HTTP and gRPC bind addresses must be different".into());
         }
         let limits = ServerLimits::new(
             self.max_request_bytes
@@ -163,6 +179,7 @@ impl ConfigArgs {
         }
         Ok(EffectiveConfig {
             bind,
+            grpc_bind,
             limits,
             artifact_root,
         })
@@ -241,9 +258,26 @@ async fn serve(config: EffectiveConfig) -> Result<(), Box<dyn std::error::Error>
     });
     match GenerationEngine::start_from_store(&config.artifact_root, EngineConfig::default()).await {
         Ok(engine) => {
-            InferenceServer::with_limits(LocalInference::new(engine), config.limits)
-                .serve(listener, cancellation)
-                .await?;
+            let grpc_listener = TcpListener::bind(config.grpc_bind).await?;
+            let local = LocalInference::new(engine);
+            let grpc = local.clone();
+            let server = InferenceServer::with_limits(local, config.limits);
+            let http_shutdown = cancellation.clone();
+            let grpc_shutdown = cancellation.clone();
+            let mut http = Box::pin(server.serve(listener, http_shutdown));
+            let mut grpc_server = Box::pin(grpc.serve_grpc(grpc_listener, grpc_shutdown));
+            tokio::select! {
+                result = &mut http => {
+                    let _ = cancellation.cancel();
+                    result?;
+                    grpc_server.await?;
+                }
+                result = &mut grpc_server => {
+                    let _ = cancellation.cancel();
+                    result?;
+                    http.await?;
+                }
+            }
         }
         Err(_) => {
             InferenceServer::with_limits(PendingInference, config.limits)
@@ -280,6 +314,7 @@ mod tests {
         let effective = arguments.resolve()?;
         assert!(effective.bind.ip().is_loopback());
         assert_eq!(effective.bind.port(), 8080);
+        assert_eq!(effective.grpc_bind.port(), 50051);
         assert_eq!(effective.limits.max_request_bytes(), 1_048_576);
         assert_eq!(
             effective.artifact_root,
@@ -329,6 +364,16 @@ mod tests {
     fn non_loopback_bind_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let cli =
             Cli::try_parse_from(["impossible-inferences", "doctor", "--bind", "0.0.0.0:8080"])?;
+        let Command::Doctor(arguments) = cli.command else {
+            return Err("doctor subcommand was not parsed".into());
+        };
+        assert!(arguments.resolve().is_err());
+        let cli = Cli::try_parse_from([
+            "impossible-inferences",
+            "doctor",
+            "--grpc-bind",
+            "0.0.0.0:50051",
+        ])?;
         let Command::Doctor(arguments) = cli.command else {
             return Err("doctor subcommand was not parsed".into());
         };

@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package impossible.inferences.v1;
+
+service InferenceService {
+  rpc Complete(CompletionRequest) returns (GenerationResponse);
+  rpc CompleteStream(CompletionRequest) returns (stream GenerationEvent);
+  rpc Chat(ChatRequest) returns (GenerationResponse);
+  rpc ChatStream(ChatRequest) returns (stream GenerationEvent);
+}
+
+message Sampling {
+  uint32 max_tokens = 1;
+  float temperature = 2;
+  float top_p = 3;
+  optional uint32 seed = 4;
+  repeated string stop = 5;
+}
+
+message CompletionRequest {
+  string model = 1;
+  string prompt = 2;
+  Sampling sampling = 3;
+}
+
+enum ChatRole {
+  CHAT_ROLE_UNSPECIFIED = 0;
+  CHAT_ROLE_SYSTEM = 1;
+  CHAT_ROLE_USER = 2;
+  CHAT_ROLE_ASSISTANT = 3;
+}
+
+message ChatMessage {
+  ChatRole role = 1;
+  string content = 2;
+}
+
+message ChatRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  Sampling sampling = 3;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+message GenerationResponse {
+  string request_id = 1;
+  string model = 2;
+  string text = 3;
+  Usage usage = 4;
+  string finish_reason = 5;
+}
+
+message GenerationEvent {
+  string request_id = 1;
+  oneof payload {
+    string delta = 2;
+    Usage usage = 3;
+    string finish_reason = 4;
+  }
+}
