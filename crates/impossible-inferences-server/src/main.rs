@@ -204,10 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 SetupMode::Online
             };
-            println!(
-                "{}",
-                serde_json::to_string(&setup(&arguments.artifact_root, mode)?)?
-            );
+            let artifact_root = arguments.artifact_root;
+            let status = tokio::task::spawn_blocking(move || setup(&artifact_root, mode)).await??;
+            println!("{}", serde_json::to_string(&status)?);
             Ok(())
         }
         Command::Serve(arguments) => serve(arguments.resolve()?).await,
