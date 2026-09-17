@@ -28,11 +28,13 @@ const DEFAULT_MAX_TOKENS: u32 = 256;
 const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
 const STREAM_BUFFER: usize = 16;
+const HEALTH_REFRESH: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct GrpcInference {
     engine: Arc<dyn InferenceEngine>,
     request_ids: RequestIdSource,
+    shutdown: CancellationToken,
 }
 
 struct CancellationGuard(CancellationToken);
@@ -44,10 +46,11 @@ impl Drop for CancellationGuard {
 }
 
 impl GrpcInference {
-    fn new(engine: Arc<dyn InferenceEngine>) -> Self {
+    fn new(engine: Arc<dyn InferenceEngine>, shutdown: CancellationToken) -> Self {
         Self {
             engine,
             request_ids: RequestIdSource::default(),
+            shutdown,
         }
     }
 
@@ -77,14 +80,21 @@ impl GrpcInference {
         convert: impl FnOnce(T) -> Result<GenerationRequest, Status>,
     ) -> Result<Response<GenerationResponse>, Status> {
         let (context, cancellation) = self.context(&request)?;
-        let _guard = CancellationGuard(cancellation);
+        let _guard = CancellationGuard(cancellation.clone());
         let request_id = format!("grpc-{}", context.id().get());
         let generation = convert(request.into_inner())?;
         let events = self
             .engine
             .generate(generation, context)
             .map_err(engine_status)?;
-        let completed = collect(events).await?;
+        let completed = tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => {
+                let _ = cancellation.cancel();
+                return Err(Status::unavailable("server is shutting down"));
+            }
+            completed = collect(events) => completed?,
+        };
         Ok(Response::new(GenerationResponse {
             request_id,
             model: impossible_inferences_protocol::model_id().to_owned(),
@@ -107,9 +117,15 @@ impl GrpcInference {
             .generate(generation, context)
             .map_err(engine_status)?;
         let (sender, receiver) = mpsc::channel(STREAM_BUFFER);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        let _ = cancellation.cancel();
+                        return;
+                    }
                     () = sender.closed() => {
                         let _ = cancellation.cancel();
                         return;
@@ -336,28 +352,77 @@ pub(crate) async fn serve(
     engine: Arc<dyn InferenceEngine>,
     listener: TcpListener,
     shutdown: CancellationToken,
+    shutdown_timeout: Duration,
 ) -> io::Result<()> {
-    let service = InferenceServiceServer::new(GrpcInference::new(engine))
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
-    let (reporter, health) = tonic_health::server::health_reporter();
-    reporter
-        .set_serving::<InferenceServiceServer<GrpcInference>>()
-        .await;
+    let request_shutdown = CancellationToken::new();
+    let service =
+        InferenceServiceServer::new(GrpcInference::new(engine.clone(), request_shutdown.clone()))
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let (mut reporter, health) = tonic_health::server::health_reporter();
+    publish_health(&mut reporter, engine.status().await.ready).await;
+    let health_shutdown = request_shutdown.clone();
+    let health_engine = engine.clone();
+    let health_monitor = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = health_shutdown.cancelled() => {
+                    reporter
+                        .set_not_serving::<InferenceServiceServer<GrpcInference>>()
+                        .await;
+                    return;
+                }
+                () = tokio::time::sleep(HEALTH_REFRESH) => {
+                    publish_health(&mut reporter, health_engine.status().await.ready).await;
+                }
+            }
+        }
+    });
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(pb::FILE_DESCRIPTOR_SET)
         .build_v1()
         .map_err(io::Error::other)?;
-    Server::builder()
+    let shutdown_signal = shutdown.clone();
+    let request_stop = request_shutdown.clone();
+    let server = Server::builder()
         .add_service(health)
         .add_service(reflection)
         .add_service(service)
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            async {
-                shutdown.cancelled().await;
+            async move {
+                shutdown_signal.cancelled().await;
+                let _ = request_stop.cancel();
             },
-        )
-        .await
-        .map_err(io::Error::other)
+        );
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result.map_err(io::Error::other),
+        () = shutdown.cancelled() => {
+            let _ = request_shutdown.cancel();
+            match tokio::time::timeout(shutdown_timeout, &mut server).await {
+                Ok(result) => result.map_err(io::Error::other),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "gRPC shutdown exceeded its configured bound",
+                )),
+            }
+        }
+    };
+    let _ = request_shutdown.cancel();
+    let _ = health_monitor.await;
+    result
+}
+
+async fn publish_health(reporter: &mut tonic_health::server::HealthReporter, ready: bool) {
+    if ready {
+        reporter
+            .set_serving::<InferenceServiceServer<GrpcInference>>()
+            .await;
+    } else {
+        reporter
+            .set_not_serving::<InferenceServiceServer<GrpcInference>>()
+            .await;
+    }
 }

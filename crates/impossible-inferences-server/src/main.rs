@@ -264,7 +264,11 @@ async fn serve(config: EffectiveConfig) -> Result<(), Box<dyn std::error::Error>
             let http_shutdown = cancellation.clone();
             let grpc_shutdown = cancellation.clone();
             let mut http = Box::pin(server.serve(listener, http_shutdown));
-            let mut grpc_server = Box::pin(grpc.serve_grpc(grpc_listener, grpc_shutdown));
+            let mut grpc_server = Box::pin(grpc.serve_grpc(
+                grpc_listener,
+                grpc_shutdown,
+                config.limits.shutdown_timeout(),
+            ));
             tokio::select! {
                 result = &mut http => {
                     let _ = cancellation.cancel();

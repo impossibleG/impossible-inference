@@ -102,6 +102,19 @@ fn valid_id(id: &Value) -> bool {
     id.is_string() || id.is_number()
 }
 
+pub(crate) fn request_id(body: &Bytes) -> Option<Value> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value.get("id").filter(|id| valid_id(id)).cloned()
+}
+
+pub(crate) fn outer_error(
+    id: Option<&Value>,
+    message: &'static str,
+    status: StatusCode,
+) -> Response {
+    rpc_error(id.unwrap_or(&Value::Null), -32_003, message, status)
+}
+
 fn valid_client_meta(params: &Value) -> bool {
     params
         .get("_meta")

@@ -23,7 +23,7 @@ use axum::{
         Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -40,7 +40,7 @@ use impossible_inferences_protocol::{
 };
 use impossible_server_core::{
     CancellationToken, DrainOutcome, HealthRegistry, ProcessState, ReadinessReason, RequestContext,
-    RequestIdSource, ServerLimits, ShutdownGate,
+    RequestId, RequestIdSource, ServerLimits, ShutdownGate, WorkGuard,
 };
 use serde::Serialize;
 use tokio::{
@@ -204,8 +204,15 @@ impl LocalInference {
         self,
         listener: TcpListener,
         shutdown: CancellationToken,
+        shutdown_timeout: Duration,
     ) -> io::Result<()> {
-        grpc::serve(self.state.engine.clone(), listener, shutdown).await
+        grpc::serve(
+            self.state.engine.clone(),
+            listener,
+            shutdown,
+            shutdown_timeout,
+        )
+        .await
     }
 }
 
@@ -500,15 +507,34 @@ async fn enforce_workload_policy(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(_work_guard) = state.shutdown_gate.try_enter() else {
-        return public_error(
+    let deadline = Instant::now() + state.limits.request_timeout();
+    let stop = state.shutdown_gate.stop_token();
+    let is_mcp = request.uri().path() == "/mcp";
+    let (request, mcp_id) = match preload_mcp_request(
+        request,
+        is_mcp,
+        state.limits.max_request_bytes(),
+        deadline,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+
+    let Some(work_guard) = state.shutdown_gate.try_enter() else {
+        return workload_error(
+            is_mcp,
+            mcp_id.as_ref(),
             StatusCode::SERVICE_UNAVAILABLE,
             "cancelled",
             "the request was cancelled",
         );
     };
-    let Ok(_admission_permit) = state.admitted.clone().try_acquire_owned() else {
-        return public_error(
+    let Ok(admission_permit) = state.admitted.clone().try_acquire_owned() else {
+        return workload_error(
+            is_mcp,
+            mcp_id.as_ref(),
             StatusCode::TOO_MANY_REQUESTS,
             "overloaded",
             "the service is temporarily overloaded",
@@ -517,90 +543,242 @@ async fn enforce_workload_policy(
 
     let cancellation = CancellationToken::new();
     let cancel_on_drop = RequestCancellationGuard(cancellation.clone());
-    let Ok(request_id) = state.request_ids.next() else {
-        return public_error(
+    let Some((request_id, context)) = build_request_context(&state, &cancellation) else {
+        return workload_error(
+            is_mcp,
+            mcp_id.as_ref(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             "an internal server error occurred",
         );
     };
-    let Ok(context) = RequestContext::new(
-        request_id,
-        cancellation.clone(),
-        Some(state.limits.request_timeout()),
-    ) else {
-        return public_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "an internal server error occurred",
-        );
-    };
-    let deadline = Instant::now() + state.limits.request_timeout();
-    let stop = state.shutdown_gate.stop_token();
     let (mut parts, body) = request.into_parts();
-    let body = tokio::select! {
-        biased;
-        () = stop.cancelled() => {
-            let _ = cancellation.cancel();
-            return public_error(StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled");
-        }
-        result = timeout_at(deadline, body::to_bytes(body, state.limits.max_request_bytes())) => {
-            match result {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(_)) => return public_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", "the request body exceeds the configured limit"),
-                Err(_) => {
-                    let _ = cancellation.cancel();
-                    return public_error(StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded");
-                }
-            }
-        }
+    let body = match read_request_body(
+        body,
+        state.limits.max_request_bytes(),
+        deadline,
+        &stop,
+        &cancellation,
+        is_mcp,
+        mcp_id.as_ref(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     parts.extensions.insert(context);
     let request = Request::from_parts(parts, body::Body::from(body));
 
-    let execution = tokio::select! {
-        biased;
-        () = stop.cancelled() => {
-            let _ = cancellation.cancel();
-            return public_error(StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled");
-        }
-        result = timeout_at(deadline, state.execution.clone().acquire_owned()) => {
-            match result {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return public_error(StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled"),
-                Err(_) => {
-                    let _ = cancellation.cancel();
-                    return public_error(StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded");
-                }
-            }
-        }
+    let execution = match acquire_execution(
+        &state,
+        deadline,
+        &stop,
+        &cancellation,
+        is_mcp,
+        mcp_id.as_ref(),
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
 
-    let mut response = tokio::select! {
-        biased;
-        () = stop.cancelled() => {
-            let _ = cancellation.cancel();
-            public_error(StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled")
-        }
-        () = tokio::time::sleep_until(deadline) => {
-            let _ = cancellation.cancel();
-            public_error(StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded")
-        }
-        response = next.run(request) => response,
-    };
+    let mut response = run_workload_handler(
+        request,
+        next,
+        deadline,
+        &stop,
+        &cancellation,
+        is_mcp,
+        mcp_id.as_ref(),
+    )
+    .await;
     if let Ok(value) = request_id.get().to_string().parse() {
         response.headers_mut().insert("x-request-id", value);
     }
-    drop(execution);
+    guard_response_body(
+        response,
+        cancel_on_drop,
+        execution,
+        admission_permit,
+        work_guard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_workload_handler(
+    request: Request,
+    next: Next,
+    deadline: Instant,
+    stop: &CancellationToken,
+    cancellation: &CancellationToken,
+    is_mcp: bool,
+    mcp_id: Option<&serde_json::Value>,
+) -> Response {
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            let _ = cancellation.cancel();
+            workload_error(is_mcp, mcp_id, StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled")
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            let _ = cancellation.cancel();
+            workload_error(is_mcp, mcp_id, StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded")
+        }
+        response = next.run(request) => response,
+    }
+}
+
+fn build_request_context(
+    state: &WorkloadMiddlewareState,
+    cancellation: &CancellationToken,
+) -> Option<(RequestId, RequestContext)> {
+    let request_id = state.request_ids.next().ok()?;
+    let context = RequestContext::new(
+        request_id,
+        cancellation.clone(),
+        Some(state.limits.request_timeout()),
+    )
+    .ok()?;
+    Some((request_id, context))
+}
+
+async fn preload_mcp_request(
+    request: Request,
+    is_mcp: bool,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<(Request, Option<serde_json::Value>), Response> {
+    if !is_mcp {
+        return Ok((request, None));
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match timeout_at(deadline, body::to_bytes(body, max_bytes)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            return Err(mcp::outer_error(
+                None,
+                "the request body exceeds the configured limit",
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ));
+        }
+        Err(_) => {
+            return Err(mcp::outer_error(
+                None,
+                "the request deadline was exceeded",
+                StatusCode::GATEWAY_TIMEOUT,
+            ));
+        }
+    };
+    let id = mcp::request_id(&bytes);
+    Ok((Request::from_parts(parts, Body::from(bytes)), id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_request_body(
+    body: Body,
+    max_bytes: usize,
+    deadline: Instant,
+    stop: &CancellationToken,
+    cancellation: &CancellationToken,
+    is_mcp: bool,
+    mcp_id: Option<&serde_json::Value>,
+) -> Result<Bytes, Response> {
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            let _ = cancellation.cancel();
+            Err(workload_error(is_mcp, mcp_id, StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled"))
+        }
+        result = timeout_at(deadline, body::to_bytes(body, max_bytes)) => {
+            match result {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(_)) => Err(workload_error(is_mcp, mcp_id, StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", "the request body exceeds the configured limit")),
+                Err(_) => {
+                    let _ = cancellation.cancel();
+                    Err(workload_error(is_mcp, mcp_id, StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded"))
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_execution(
+    state: &WorkloadMiddlewareState,
+    deadline: Instant,
+    stop: &CancellationToken,
+    cancellation: &CancellationToken,
+    is_mcp: bool,
+    mcp_id: Option<&serde_json::Value>,
+) -> Result<OwnedSemaphorePermit, Response> {
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            let _ = cancellation.cancel();
+            Err(workload_error(is_mcp, mcp_id, StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled"))
+        }
+        result = timeout_at(deadline, state.execution.clone().acquire_owned()) => {
+            match result {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_)) => Err(workload_error(is_mcp, mcp_id, StatusCode::SERVICE_UNAVAILABLE, "cancelled", "the request was cancelled")),
+                Err(_) => {
+                    let _ = cancellation.cancel();
+                    Err(workload_error(is_mcp, mcp_id, StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", "the request deadline was exceeded"))
+                }
+            }
+        }
+    }
+}
+
+fn guard_response_body(
+    response: Response,
+    cancel_on_drop: RequestCancellationGuard,
+    execution: OwnedSemaphorePermit,
+    admission_permit: OwnedSemaphorePermit,
+    work_guard: WorkGuard,
+) -> Response {
     let (parts, body) = response.into_parts();
     let data = body.into_data_stream();
     let guarded = stream::unfold(
-        (data, cancel_on_drop),
-        |(mut data, cancel_on_drop)| async move {
-            data.next().await.map(|item| (item, (data, cancel_on_drop)))
+        (
+            data,
+            cancel_on_drop,
+            execution,
+            admission_permit,
+            work_guard,
+        ),
+        |(mut data, cancel_on_drop, execution, admission_permit, work_guard)| async move {
+            data.next().await.map(|item| {
+                (
+                    item,
+                    (
+                        data,
+                        cancel_on_drop,
+                        execution,
+                        admission_permit,
+                        work_guard,
+                    ),
+                )
+            })
         },
     );
     Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+fn workload_error(
+    is_mcp: bool,
+    mcp_id: Option<&serde_json::Value>,
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response {
+    if is_mcp {
+        mcp::outer_error(mcp_id, message, status)
+    } else {
+        public_error(status, code, message)
+    }
 }
 
 async fn normalize_public_failures(request: Request, next: Next) -> Response {
@@ -730,8 +908,16 @@ enum ResponseMode {
 async fn completions(
     State(state): State<TransportState>,
     Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !is_json_content_type(&headers) {
+        return public_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request",
+            "Content-Type must be application/json",
+        );
+    }
     let request: CompletionRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => {
@@ -756,8 +942,16 @@ async fn completions(
 async fn chat_completions(
     State(state): State<TransportState>,
     Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !is_json_content_type(&headers) {
+        return public_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request",
+            "Content-Type must be application/json",
+        );
+    }
     let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => {
@@ -777,6 +971,14 @@ async fn chat_completions(
         streaming,
     )
     .await
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
 }
 
 async fn generation_response(
@@ -1479,6 +1681,9 @@ mod tests {
     use impossible_server_testkit::reserve_loopback_listener;
     use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientWebSocketMessage};
+    use tonic_health::pb::{
+        HealthCheckRequest, health_check_response, health_client::HealthClient,
+    };
     use tower::ServiceExt;
 
     use super::{
@@ -1856,19 +2061,31 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct FakeInferenceEngine {
         cancelled: Arc<Notify>,
         observed_cancellation: Arc<AtomicBool>,
+        ready: Arc<AtomicBool>,
+    }
+
+    impl Default for FakeInferenceEngine {
+        fn default() -> Self {
+            Self {
+                cancelled: Arc::new(Notify::new()),
+                observed_cancellation: Arc::new(AtomicBool::new(false)),
+                ready: Arc::new(AtomicBool::new(true)),
+            }
+        }
     }
 
     impl InferenceEngine for FakeInferenceEngine {
         fn status(&self) -> EngineFuture<'_, EngineStatus> {
-            Box::pin(async {
+            let ready = self.ready.load(Ordering::Acquire);
+            Box::pin(async move {
                 EngineStatus {
-                    ready: true,
-                    runtime: "running",
-                    model: "loaded",
+                    ready,
+                    runtime: if ready { "running" } else { "unavailable" },
+                    model: if ready { "loaded" } else { "not_loaded" },
                     profile: CURATED_MODEL_ID,
                 }
             })
@@ -1999,6 +2216,59 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_grpc_health_tracks_readiness(
+        address: SocketAddr,
+        engine: &FakeInferenceEngine,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel = tonic::transport::Channel::from_shared(format!("http://{address}"))?
+            .connect()
+            .await?;
+        let mut health = HealthClient::new(channel);
+        let service = "impossible.inferences.v1.InferenceService".to_owned();
+        let serving = health
+            .check(HealthCheckRequest {
+                service: service.clone(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            serving.status,
+            health_check_response::ServingStatus::Serving as i32
+        );
+        engine.ready.store(false, Ordering::Release);
+        let mut unavailable = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let status = health
+                .check(HealthCheckRequest {
+                    service: service.clone(),
+                })
+                .await?
+                .into_inner();
+            if status.status == health_check_response::ServingStatus::NotServing as i32 {
+                unavailable = true;
+                break;
+            }
+        }
+        if !unavailable {
+            return Err("gRPC health did not become NOT_SERVING".into());
+        }
+        engine.ready.store(true, Ordering::Release);
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let status = health
+                .check(HealthCheckRequest {
+                    service: service.clone(),
+                })
+                .await?
+                .into_inner();
+            if status.status == health_check_response::ServingStatus::Serving as i32 {
+                return Ok(());
+            }
+        }
+        Err("gRPC health did not return to SERVING".into())
+    }
+
     async fn assert_http_failures(
         client: &reqwest::Client,
         endpoint: &str,
@@ -2011,6 +2281,23 @@ mod tests {
             .await?;
         assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
         assert!(malformed.text().await?.contains("invalid_request"));
+
+        let wrong_media_type = client
+            .post(endpoint)
+            .header("content-type", "text/plain")
+            .body(
+                serde_json::json!({
+                    "model": CURATED_MODEL_ID,
+                    "prompt": "hello"
+                })
+                .to_string(),
+            )
+            .send()
+            .await?;
+        assert_eq!(
+            wrong_media_type.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
 
         let unsupported = client
             .post(endpoint)
@@ -2040,6 +2327,47 @@ mod tests {
             .send()
             .await?;
         assert_eq!(slow.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sse_holds_execution_capacity_until_the_body_is_dropped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = test_limits(1_024, 1, 1, Duration::from_secs(1), Duration::from_secs(1))?;
+        let (address, shutdown, join, _engine) = spawn_transport_server(limits).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let endpoint = format!("http://{address}/v1/completions");
+        let streaming = client
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "prompt": "slow",
+                "stream": true
+            }))
+            .send()
+            .await?;
+        assert_eq!(streaming.status(), reqwest::StatusCode::OK);
+
+        let mut queued = Box::pin(
+            client
+                .post(&endpoint)
+                .json(&serde_json::json!({
+                    "model": CURATED_MODEL_ID,
+                    "prompt": "hello"
+                }))
+                .send(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut queued)
+                .await
+                .is_err()
+        );
+        drop(streaming);
+        let completed = tokio::time::timeout(Duration::from_secs(1), queued).await??;
+        assert_eq!(completed.status(), reqwest::StatusCode::OK);
+
+        let _ = shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
         Ok(())
     }
 
@@ -2348,6 +2676,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_outer_admission_and_deadline_failures_remain_json_rpc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = test_limits(
+            1_024,
+            1,
+            1,
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+        )?;
+        let (address, shutdown, join, _engine) = spawn_transport_server(limits).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let slow_request = |id: u64| {
+            client
+                .post(format!("http://{address}/mcp"))
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", "generate_text")
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "generate_text",
+                        "arguments": {"model": CURATED_MODEL_ID, "prompt": "slow"},
+                        "_meta": mcp_meta()
+                    }
+                }))
+                .send()
+        };
+        let first = tokio::spawn(slow_request(11));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = tokio::spawn(slow_request(12));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let overloaded = slow_request(13).await?;
+        assert_eq!(overloaded.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let overloaded: serde_json::Value = overloaded.json().await?;
+        assert_eq!(overloaded["jsonrpc"], "2.0");
+        assert_eq!(overloaded["id"], 13);
+        assert!(overloaded.get("error").is_some());
+
+        for (response, id) in [(first.await??, 11), (second.await??, 12)] {
+            assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+            let response: serde_json::Value = response.json().await?;
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], id);
+            assert!(response.get("error").is_some());
+        }
+
+        let _ = shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn real_network_grpc_unary_streaming_validation_and_disconnect_are_bounded()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = reserve_loopback_listener().await?;
@@ -2355,9 +2738,11 @@ mod tests {
         let shutdown = CancellationToken::new();
         let engine = FakeInferenceEngine::default();
         let local = LocalInference::new(engine.clone());
-        let join = tokio::spawn(local.serve_grpc(listener, shutdown.clone()));
+        let join =
+            tokio::spawn(local.serve_grpc(listener, shutdown.clone(), Duration::from_secs(1)));
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut client = InferenceServiceClient::connect(format!("http://{address}")).await?;
+        assert_grpc_health_tracks_readiness(address, &engine).await?;
 
         let response = client
             .complete(GrpcCompletionRequest {
@@ -2437,11 +2822,10 @@ mod tests {
             })
             .await?
             .into_inner();
-        drop(slow);
-        wait_for_fake_cancellation(&engine).await?;
-
         let _ = shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), join).await???;
+        drop(slow);
+        wait_for_fake_cancellation(&engine).await?;
         Ok(())
     }
 }

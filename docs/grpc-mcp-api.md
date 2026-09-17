@@ -19,7 +19,10 @@ The source contract is
 
 Messages are limited to 1 MiB. Client `grpc-timeout` is honored up to the server's 30-second
 upper bound. Dropping a response stream cancels or safely abandons generation and releases its
-bounded engine lane. The listener also exposes standard gRPC health and v1 reflection. A bundled
+bounded engine lane. The listener also exposes standard gRPC health and v1 reflection. Health is
+`SERVING` only while the local engine reports ready and transitions to `NOT_SERVING` when the
+runtime becomes unavailable. Shutdown cancels active calls and bounds the complete gRPC drain by
+the configured server shutdown timeout. A bundled
 `protoc` builds the checked-in contract; users do not need a system Protocol Buffers compiler.
 
 Example with `grpcurl` after starting the server:
@@ -40,6 +43,8 @@ The JSON-RPC `params._meta` object must include `io.modelcontextprotocol/clientI
 Available tools are `generate_text`, `chat`, `list_models`, and `health`. Available resources are
 `impossible://models`, `impossible://health`, and `impossible://capabilities`. Generation tools are
 deliberately non-streaming and use the same request deadline and admission limits as ordinary HTTP.
+Admission, timeout, and shutdown failures remain JSON-RPC 2.0 error responses and preserve a
+parseable request ID.
 There are no filesystem, administrative, media, embedding, tool-calling, or model-download tools.
 
 ```bash

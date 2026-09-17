@@ -6,7 +6,9 @@ different model.
 
 ## HTTP completion and chat
 
-`POST /v1/completions` accepts a string `prompt`. `POST /v1/chat/completions` accepts ordered
+Both routes require `Content-Type: application/json`; payloads sent as `text/plain` or another
+media type are rejected even when their bytes contain valid JSON. `POST /v1/completions` accepts
+a string `prompt`. `POST /v1/chat/completions` accepts ordered
 `system`, `user`, and `assistant` messages whose content is plain text. Both accept `max_tokens`,
 `temperature`, `top_p`, `seed`, `stop` as a string or string array, and `stream`.
 
@@ -27,7 +29,9 @@ This privacy-preserving local check does not run a second tokenizer and may reje
 the actual tokenizer boundary. During generation, both non-empty runtime delta count and reported
 completion usage are independently limited by `max_tokens`.
 
-Set `stream` to `true` for `text/event-stream`. Ordered chunks contain text deltas, followed by a
+Set `stream` to `true` for `text/event-stream`. The request remains admitted and consumes one
+configured execution slot until the response body finishes or disconnects. Ordered chunks contain
+text deltas, followed by a
 usage chunk, a finish chunk, and `data: [DONE]`. Slow consumers are bounded by the engine event
 queue. Client disconnect, server shutdown, and request deadline cancel or fence the generation.
 
