@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,6 +38,8 @@ jobs:
         run: ./scripts/verify-foundation-snapshot.tests.ps1
       - shell: pwsh
         run: ./scripts/test-line-endings.ps1
+      - shell: pwsh
+        run: ./scripts/generate-third-party-notices.ps1 -Check
 
   supply-chain:
     runs-on: ubuntu-latest
@@ -46,3 +49,36 @@ jobs:
         with:
           arguments: --locked --all-features
           command: check advisories bans licenses sources
+
+  native-packages:
+    needs: validate
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.88.0
+        with:
+          toolchain: 1.88.0
+      - run: cargo build --locked --release -p impossible-inferences-server
+      - shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+      - shell: pwsh
+        run: ./scripts/package-smoke.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: impossible-inferences-${{ runner.os }}-x86_64
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  linux-container:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: docker build --tag impossible-inferences-ci .
+      - run: docker run --rm impossible-inferences-ci --version

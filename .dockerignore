@@ -1,4 +1,5 @@
 /.planning/
+/.git/
 /target/
 /dist/
 /models/
