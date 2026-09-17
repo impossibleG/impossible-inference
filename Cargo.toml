@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/impossible-inferences-domain",
+    "crates/impossible-inferences-protocol",
+    "crates/impossible-inferences-engine",
+    "crates/impossible-inferences-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+impossible-inferences-domain = { version = "=0.1.0", path = "crates/impossible-inferences-domain" }
+impossible-inferences-protocol = { version = "=0.1.0", path = "crates/impossible-inferences-protocol" }
+impossible-inferences-engine = { version = "=0.1.0", path = "crates/impossible-inferences-engine" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
