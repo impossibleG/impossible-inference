@@ -1,19 +1,17 @@
 # Impossible Inferences
 
 Impossible Inferences is a ready-made, self-hosted token-completion server for local open models.
-Version 0.1 will provide one curated CPU inference path with automatic verified setup, offline
-operation after installation, OpenAI-compatible completion and chat endpoints, token streaming,
-WebSocket cancellation, gRPC, and bounded MCP tools.
+Version 0.1 provides one curated CPU inference path with automatic verified setup, offline
+operation after installation, OpenAI-compatible completion and chat endpoints, SSE token
+streaming, and WebSocket cancellation. gRPC and bounded MCP tools are still pending.
 
-The repository is being implemented in incremental, buildable commits. The initial bootstrap
-contains the public contract and crate boundaries; it does not yet contain a token-generation
-engine. See [the v0.1 product contract](docs/product-contract.md) for the exact promise and explicit
-non-goals.
+The repository is implemented in incremental, buildable commits. See [the v0.1 product
+contract](docs/product-contract.md) for the exact promise and explicit non-goals.
 
 ## Current status
 
-The bounded control plane is runnable, but token generation is not implemented yet. Do not treat
-this revision as a functional inference server.
+The local engine and HTTP/SSE/WebSocket generation paths are implemented. Setup must complete
+before readiness and generation become available.
 
 ```powershell
 cargo run -p impossible-inferences-server -- doctor
@@ -22,23 +20,36 @@ cargo run -p impossible-inferences-server -- setup
 cargo run -p impossible-inferences-server -- serve
 ```
 
+In another terminal:
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H "content-type: application/json" \
+  -d '{"model":"qwen2.5-0.5b-instruct-q4-k-m","prompt":"Write one friendly sentence.","max_tokens":64}'
+```
+
 The server binds to `127.0.0.1:8080` by default and refuses non-loopback addresses. Effective
 configuration precedence is command-line flag, environment variable, optional bounded JSON file,
 then safe default. Run `cargo run -p impossible-inferences-server -- serve --help` for the exact
 variables and limits. The current control plane exposes `/health/live`, `/health/ready`, `/metrics`,
-`/version`, `/v1/capabilities`, `/v1/models`, and `/status`; readiness remains false until a verified
-runtime and model are installed and the generation adapter is healthy.
+`/version`, `/v1/capabilities`, `/v1/models`, `/status`, `/v1/completions`,
+`/v1/chat/completions`, and `/v1/ws`; readiness remains false until a verified runtime and model are
+installed and the private generation sidecar is healthy. See [the HTTP, SSE, and WebSocket API
+guide](docs/http-websocket-api.md) for the bounded wire contract.
 
 Setup pins and verifies the official llama.cpp `b10964` Windows/Linux x86-64 CPU runtime and the
 official Qwen2.5 0.5B Instruct Q4_K_M GGUF profile. It stages downloads under the ignored
 `runtime-artifacts/` directory and atomically promotes a complete installation. Run `setup
 --offline` to verify the retained runtime archive and model and reconstruct extracted runtime files
-without network access. `serve`, `doctor`, and `status` never download artifacts.
+without network access. `serve`, `doctor`, and `status` never download artifacts. `serve` starts
+llama.cpp only on an ephemeral loopback port behind an internal per-process bearer and does not
+proxy its UI, admin, model-download, router, tool, embedding, or media routes.
 
 The repository vendors the reviewed Impossible Server core and testkit as a deterministic source
 snapshot. That snapshot supplies bounded lifecycle, health, request, cancellation, and test
 primitives. It does not contain HTTP, SSE, WebSocket, gRPC, MCP, automatic setup, or inference
-implementations; those remain product work tracked by this contract.
+implementations; the product implements each of those explicitly. gRPC, MCP, and packaging remain
+pending in this revision.
 
 ## License
 

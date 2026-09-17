@@ -1,6 +1,7 @@
 //! Bounded HTTP control plane for Impossible Inferences.
 
 use std::{
+    convert::Infallible,
     future::{Future, IntoFuture, poll_fn},
     io,
     pin::Pin,
@@ -9,17 +10,31 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::Poll,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    Json, Router, body,
-    extract::{Request, State},
+    Extension, Json, Router,
+    body::{self, Body, Bytes},
+    extract::{
+        Request, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::get,
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
+    routing::{get, post},
 };
-use impossible_inferences_engine::GenerationEngine;
+use futures_util::{StreamExt, stream};
+use impossible_inferences_domain::{FinishReason, GenerationEvent, GenerationRequest, TokenUsage};
+use impossible_inferences_engine::{EngineError, EngineStatus, GenerationEngine, GenerationStream};
+use impossible_inferences_protocol::{
+    ChatCompletionRequest, CompletionRequest, WebSocketClientMessage, WebSocketGeneration,
+    WebSocketServerMessage, model_id,
+};
 use impossible_server_core::{
     CancellationToken, DrainOutcome, HealthRegistry, ProcessState, ReadinessReason, RequestContext,
     RequestIdSource, ServerLimits, ShutdownGate,
@@ -27,12 +42,65 @@ use impossible_server_core::{
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout_at},
 };
 
 /// Boxed shutdown future returned by a workload implementation.
 pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Boxed engine future used by transport adapters and test doubles.
+pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Transport-owned view of one bounded engine event stream.
+pub trait EngineEventStream: Send {
+    /// Receives the next ordered event.
+    fn recv(&mut self) -> EngineFuture<'_, Option<Result<GenerationEvent, EngineError>>>;
+}
+
+impl EngineEventStream for GenerationStream {
+    fn recv(&mut self) -> EngineFuture<'_, Option<Result<GenerationEvent, EngineError>>> {
+        Box::pin(GenerationStream::recv(self))
+    }
+}
+
+/// Minimal generation boundary consumed by public transports.
+pub trait InferenceEngine: Send + Sync + 'static {
+    /// Returns current privacy-safe state.
+    fn status(&self) -> EngineFuture<'_, EngineStatus>;
+
+    /// Admits one normalized generation request.
+    ///
+    /// # Errors
+    /// Returns a stable engine error for invalid input, bounded overload, or unavailable runtime.
+    fn generate(
+        &self,
+        request: GenerationRequest,
+        context: RequestContext,
+    ) -> Result<Box<dyn EngineEventStream>, EngineError>;
+
+    /// Terminates the owned runtime.
+    fn shutdown(&self) -> EngineFuture<'_, Result<(), EngineError>>;
+}
+
+impl InferenceEngine for GenerationEngine {
+    fn status(&self) -> EngineFuture<'_, EngineStatus> {
+        Box::pin(GenerationEngine::status(self))
+    }
+
+    fn generate(
+        &self,
+        request: GenerationRequest,
+        context: RequestContext,
+    ) -> Result<Box<dyn EngineEventStream>, EngineError> {
+        GenerationEngine::generate(self, request, context)
+            .map(|stream| Box::new(stream) as Box<dyn EngineEventStream>)
+    }
+
+    fn shutdown(&self) -> EngineFuture<'_, Result<(), EngineError>> {
+        Box::pin(GenerationEngine::shutdown(self))
+    }
+}
 
 /// Server-owned context exposed to a workload extension.
 #[derive(Debug, Clone)]
@@ -106,18 +174,40 @@ impl Workload for PendingInference {
     }
 }
 
-/// Ready private generation workload. Public generation transports are added separately.
-#[derive(Debug, Clone)]
+/// Ready local generation workload with bounded public HTTP and WebSocket transports.
+#[derive(Clone)]
 pub struct LocalInference {
-    engine: GenerationEngine,
+    state: TransportState,
 }
 
 impl LocalInference {
     /// Wraps a successfully started private generation engine.
     #[must_use]
-    pub const fn new(engine: GenerationEngine) -> Self {
-        Self { engine }
+    pub fn new(engine: impl InferenceEngine) -> Self {
+        Self {
+            state: TransportState {
+                engine: Arc::new(engine),
+                websocket_sessions: Arc::new(Semaphore::new(16)),
+                websocket_request_ids: RequestIdSource::default(),
+            },
+        }
     }
+}
+
+impl std::fmt::Debug for LocalInference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalInference")
+            .field("engine", &"redacted")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct TransportState {
+    engine: Arc<dyn InferenceEngine>,
+    websocket_sessions: Arc<Semaphore>,
+    websocket_request_ids: RequestIdSource,
 }
 
 impl Workload for LocalInference {
@@ -126,7 +216,7 @@ impl Workload for LocalInference {
     }
 
     fn routes(&self, context: WorkloadContext) -> Router {
-        let monitor_engine = self.engine.clone();
+        let monitor_engine = self.state.engine.clone();
         let monitor_context = context.clone();
         let terminal = context.shutdown_token();
         tokio::spawn(async move {
@@ -144,7 +234,10 @@ impl Workload for LocalInference {
         Router::new()
             .route("/status", get(local_status))
             .route("/v1/models", get(local_models))
-            .with_state(self.engine.clone())
+            .route("/v1/completions", post(completions))
+            .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/ws", get(websocket_upgrade))
+            .with_state(self.state.clone())
     }
 
     fn engine_available(&self) -> bool {
@@ -153,7 +246,7 @@ impl Workload for LocalInference {
 
     fn shutdown(&self, _force: CancellationToken) -> ShutdownFuture<'_> {
         Box::pin(async move {
-            let _ = self.engine.shutdown().await;
+            let _ = self.state.engine.shutdown().await;
         })
     }
 }
@@ -407,7 +500,7 @@ async fn enforce_workload_policy(
     };
 
     let cancellation = CancellationToken::new();
-    let _cancel_on_drop = RequestCancellationGuard(cancellation.clone());
+    let cancel_on_drop = RequestCancellationGuard(cancellation.clone());
     let Ok(request_id) = state.request_ids.next() else {
         return public_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -483,7 +576,15 @@ async fn enforce_workload_policy(
         response.headers_mut().insert("x-request-id", value);
     }
     drop(execution);
-    response
+    let (parts, body) = response.into_parts();
+    let data = body.into_data_stream();
+    let guarded = stream::unfold(
+        (data, cancel_on_drop),
+        |(mut data, cancel_on_drop)| async move {
+            data.next().await.map(|item| (item, (data, cancel_on_drop)))
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(guarded))
 }
 
 async fn normalize_public_failures(request: Request, next: Next) -> Response {
@@ -540,33 +641,52 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> 
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     state.metrics.increment();
     let available: &[&str] = if state.engine_available {
-        &["generation_engine"]
+        &[
+            "generation_engine",
+            "completions",
+            "chat_completions",
+            "sse",
+            "websocket",
+        ]
     } else {
         &[]
+    };
+    let pending: &[&str] = if state.engine_available {
+        &["grpc", "mcp"]
+    } else {
+        &[
+            "generation_engine",
+            "completions",
+            "chat_completions",
+            "sse",
+            "websocket",
+            "grpc",
+            "mcp",
+        ]
     };
     Json(serde_json::json!({
         "schema_version": 1,
         "product": "impossible-inferences",
         "version": env!("CARGO_PKG_VERSION"),
         "available": available,
-        "pending": ["completions", "chat_completions", "sse", "websocket", "grpc", "mcp"]
+        "pending": pending
     }))
 }
 
-async fn local_status(State(engine): State<GenerationEngine>) -> Json<serde_json::Value> {
-    let status = engine.status().await;
+async fn local_status(State(state): State<TransportState>) -> Json<serde_json::Value> {
+    let status = state.engine.status().await;
     Json(serde_json::json!({
         "status": if status.ready { "ready" } else { "not_ready" },
         "runtime": status.runtime,
         "model": status.model,
         "profile": status.profile,
         "ready": status.ready,
-        "public_generation_transports": "pending"
+        "public_generation_transports": ["http", "sse", "websocket"]
     }))
 }
 
-async fn local_models(State(engine): State<GenerationEngine>) -> Json<serde_json::Value> {
-    let status = engine.status().await;
+async fn local_models(State(state): State<TransportState>) -> Json<serde_json::Value> {
+    let status = state.engine.status().await;
     let data = if status.ready {
         vec![serde_json::json!({
             "id": status.profile,
@@ -581,6 +701,666 @@ async fn local_models(State(engine): State<GenerationEngine>) -> Json<serde_json
         "data": data,
         "status": if status.ready { "loaded" } else { "not_ready" }
     }))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResponseMode {
+    Completion,
+    Chat,
+}
+
+async fn completions(
+    State(state): State<TransportState>,
+    Extension(context): Extension<RequestContext>,
+    body: Bytes,
+) -> Response {
+    let request: CompletionRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return public_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the request body is not valid for this endpoint",
+            );
+        }
+    };
+    let streaming = request.stream;
+    generation_response(
+        state,
+        context,
+        request.into_generation(),
+        ResponseMode::Completion,
+        streaming,
+    )
+    .await
+}
+
+async fn chat_completions(
+    State(state): State<TransportState>,
+    Extension(context): Extension<RequestContext>,
+    body: Bytes,
+) -> Response {
+    let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return public_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the request body is not valid for this endpoint",
+            );
+        }
+    };
+    let streaming = request.stream;
+    generation_response(
+        state,
+        context,
+        request.into_generation(),
+        ResponseMode::Chat,
+        streaming,
+    )
+    .await
+}
+
+async fn generation_response(
+    state: TransportState,
+    context: RequestContext,
+    request: GenerationRequest,
+    mode: ResponseMode,
+    streaming: bool,
+) -> Response {
+    let request_id = format_request_id(mode, context.id().get());
+    let events = match state.engine.generate(request, context) {
+        Ok(events) => events,
+        Err(error) => return engine_error_response(error),
+    };
+    if streaming {
+        return sse_response(events, request_id, mode);
+    }
+    collect_response(events, request_id, mode).await
+}
+
+async fn collect_response(
+    mut events: Box<dyn EngineEventStream>,
+    request_id: String,
+    mode: ResponseMode,
+) -> Response {
+    let mut text = String::new();
+    let mut usage = None;
+    let mut finish = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            Ok(GenerationEvent::Delta(delta)) => text.push_str(&delta),
+            Ok(GenerationEvent::Usage(value)) => usage = Some(value),
+            Ok(GenerationEvent::Finished(reason)) => finish = Some(reason),
+            Err(error) => return engine_error_response(error),
+        }
+    }
+    let (Some(usage), Some(finish)) = (usage, finish) else {
+        return engine_error_response(EngineError::RuntimeProtocol);
+    };
+    let choice = match mode {
+        ResponseMode::Completion => serde_json::json!({
+            "text": text,
+            "index": 0,
+            "logprobs": null,
+            "finish_reason": finish_reason(finish)
+        }),
+        ResponseMode::Chat => serde_json::json!({
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": finish_reason(finish)
+        }),
+    };
+    Json(serde_json::json!({
+        "id": request_id,
+        "object": match mode {
+            ResponseMode::Completion => "text_completion",
+            ResponseMode::Chat => "chat.completion",
+        },
+        "created": unix_timestamp(),
+        "model": model_id(),
+        "choices": [choice],
+        "usage": usage_json(usage)
+    }))
+    .into_response()
+}
+
+struct SseState {
+    events: Box<dyn EngineEventStream>,
+    request_id: String,
+    mode: ResponseMode,
+    send_done: bool,
+    finished: bool,
+}
+
+fn sse_response(
+    events: Box<dyn EngineEventStream>,
+    request_id: String,
+    mode: ResponseMode,
+) -> Response {
+    let stream = stream::unfold(
+        SseState {
+            events,
+            request_id,
+            mode,
+            send_done: false,
+            finished: false,
+        },
+        |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            if state.send_done {
+                state.finished = true;
+                return Some((Ok::<_, Infallible>(Event::default().data("[DONE]")), state));
+            }
+            let event = state.events.recv().await;
+            let output = match event {
+                Some(Ok(GenerationEvent::Delta(delta))) => Event::default().data(stream_chunk(
+                    &state.request_id,
+                    state.mode,
+                    Some(&delta),
+                    None,
+                    None,
+                )),
+                Some(Ok(GenerationEvent::Usage(usage))) => Event::default().data(stream_chunk(
+                    &state.request_id,
+                    state.mode,
+                    None,
+                    None,
+                    Some(usage),
+                )),
+                Some(Ok(GenerationEvent::Finished(reason))) => {
+                    state.send_done = true;
+                    Event::default().data(stream_chunk(
+                        &state.request_id,
+                        state.mode,
+                        None,
+                        Some(reason),
+                        None,
+                    ))
+                }
+                Some(Err(error)) => {
+                    state.finished = true;
+                    let (_, code, message) = engine_error(error);
+                    Event::default().event("error").data(
+                        serde_json::json!({"error": {"code": code, "message": message}})
+                            .to_string(),
+                    )
+                }
+                None => {
+                    state.finished = true;
+                    Event::default().event("error").data(
+                        serde_json::json!({"error": {"code": "upstream_protocol", "message": "the local runtime ended unexpectedly"}})
+                            .to_string(),
+                    )
+                }
+            };
+            Some((Ok(output), state))
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_millis(100))
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+fn stream_chunk(
+    request_id: &str,
+    mode: ResponseMode,
+    delta: Option<&str>,
+    finish: Option<FinishReason>,
+    usage: Option<TokenUsage>,
+) -> String {
+    let choices = if usage.is_some() {
+        Vec::new()
+    } else {
+        vec![match mode {
+            ResponseMode::Completion => serde_json::json!({
+                "text": delta.unwrap_or_default(),
+                "index": 0,
+                "logprobs": null,
+                "finish_reason": finish.map(finish_reason)
+            }),
+            ResponseMode::Chat => serde_json::json!({
+                "index": 0,
+                "delta": if let Some(delta) = delta {
+                    serde_json::json!({"content": delta})
+                } else {
+                    serde_json::json!({})
+                },
+                "finish_reason": finish.map(finish_reason)
+            }),
+        }]
+    };
+    let mut chunk = serde_json::json!({
+        "id": request_id,
+        "object": match mode {
+            ResponseMode::Completion => "text_completion",
+            ResponseMode::Chat => "chat.completion.chunk",
+        },
+        "created": unix_timestamp(),
+        "model": model_id(),
+        "choices": choices
+    });
+    if let Some(usage) = usage {
+        chunk["usage"] = usage_json(usage);
+    }
+    chunk.to_string()
+}
+
+fn engine_error_response(error: EngineError) -> Response {
+    let (status, code, message) = engine_error(error);
+    public_error(status, code, message)
+}
+
+fn engine_error(error: EngineError) -> (StatusCode, &'static str, &'static str) {
+    match error {
+        EngineError::InvalidRequest(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the generation request is invalid",
+        ),
+        EngineError::Overloaded => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "overloaded",
+            "the service is temporarily overloaded",
+        ),
+        EngineError::Cancelled => (
+            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+            "cancelled",
+            "the request was cancelled",
+        ),
+        EngineError::DeadlineExceeded => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline_exceeded",
+            "the request deadline was exceeded",
+        ),
+        EngineError::ArtifactsUnavailable | EngineError::RuntimeUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "the local inference runtime is unavailable",
+        ),
+        EngineError::RuntimeProtocol => (
+            StatusCode::BAD_GATEWAY,
+            "upstream_protocol",
+            "the local runtime returned an invalid response",
+        ),
+        EngineError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "the service is shutting down",
+        ),
+        EngineError::Configuration => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "an internal server error occurred",
+        ),
+    }
+}
+
+const fn finish_reason(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::Cancelled => "cancelled",
+    }
+}
+
+fn usage_json(usage: TokenUsage) -> serde_json::Value {
+    serde_json::json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens
+    })
+}
+
+fn format_request_id(mode: ResponseMode, id: u64) -> String {
+    format!(
+        "{}-{id}",
+        match mode {
+            ResponseMode::Completion => "cmpl",
+            ResponseMode::Chat => "chatcmpl",
+        }
+    )
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+async fn websocket_upgrade(
+    State(state): State<TransportState>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Ok(permit) = state.websocket_sessions.clone().try_acquire_owned() else {
+        return public_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "overloaded",
+            "the WebSocket session limit is reached",
+        );
+    };
+    upgrade
+        .max_message_size(1_048_576)
+        .max_frame_size(1_048_576)
+        .on_upgrade(move |socket| websocket_session(socket, state, permit))
+        .into_response()
+}
+
+struct ActiveWebSocketGeneration {
+    id: String,
+    cancellation: CancellationToken,
+    events: Box<dyn EngineEventStream>,
+    usage: Option<TokenUsage>,
+}
+
+enum WebSocketInput {
+    Socket(Option<Result<Message, axum::Error>>),
+    Engine(Option<Result<GenerationEvent, EngineError>>),
+}
+
+async fn websocket_session(
+    mut socket: WebSocket,
+    state: TransportState,
+    _permit: OwnedSemaphorePermit,
+) {
+    if send_websocket(
+        &mut socket,
+        &WebSocketServerMessage::Ready {
+            version: 1,
+            model: model_id(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    let mut active: Option<ActiveWebSocketGeneration> = None;
+    loop {
+        if active.is_none() {
+            let Some(message) = socket.next().await else {
+                return;
+            };
+            let Ok(message) = message else {
+                return;
+            };
+            if !handle_websocket_message(&mut socket, &state, &mut active, message).await {
+                return;
+            }
+            continue;
+        }
+        let input = tokio::select! {
+            message = socket.next() => WebSocketInput::Socket(message),
+            event = async {
+                match active.as_mut() {
+                    Some(active) => active.events.recv().await,
+                    None => None,
+                }
+            } => WebSocketInput::Engine(event),
+        };
+        match input {
+            WebSocketInput::Socket(Some(Ok(message))) => {
+                if !handle_websocket_message(&mut socket, &state, &mut active, message).await {
+                    return;
+                }
+            }
+            WebSocketInput::Socket(_) => {
+                cancel_active(&mut active);
+                return;
+            }
+            WebSocketInput::Engine(event) => {
+                if !handle_websocket_event(&mut socket, &mut active, event).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_websocket_message(
+    socket: &mut WebSocket,
+    state: &TransportState,
+    active: &mut Option<ActiveWebSocketGeneration>,
+    message: Message,
+) -> bool {
+    match message {
+        Message::Text(text) => {
+            let command: WebSocketClientMessage = match serde_json::from_str(text.as_str()) {
+                Ok(command) => command,
+                Err(_) => {
+                    return send_websocket_error(
+                        socket,
+                        None,
+                        "invalid_request",
+                        "the WebSocket message is invalid",
+                    )
+                    .await;
+                }
+            };
+            match command {
+                WebSocketClientMessage::Start { id, request } => {
+                    start_websocket_generation(socket, state, active, id, request).await
+                }
+                WebSocketClientMessage::Cancel { id } => {
+                    if active.as_ref().is_some_and(|request| request.id == id) {
+                        cancel_active(active);
+                        send_websocket_error(
+                            socket,
+                            Some(&id),
+                            "cancelled",
+                            "the request was cancelled",
+                        )
+                        .await
+                    } else {
+                        send_websocket_error(
+                            socket,
+                            Some(&id),
+                            "invalid_request",
+                            "no matching request is active",
+                        )
+                        .await
+                    }
+                }
+                WebSocketClientMessage::Ping => {
+                    send_websocket(socket, &WebSocketServerMessage::Pong)
+                        .await
+                        .is_ok()
+                }
+                WebSocketClientMessage::Close => {
+                    cancel_active(active);
+                    let _ = socket.send(Message::Close(None)).await;
+                    false
+                }
+            }
+        }
+        Message::Binary(_) => {
+            send_websocket_error(
+                socket,
+                None,
+                "invalid_request",
+                "binary and media messages are not supported",
+            )
+            .await
+        }
+        Message::Ping(value) => socket.send(Message::Pong(value)).await.is_ok(),
+        Message::Pong(_) => true,
+        Message::Close(_) => {
+            cancel_active(active);
+            false
+        }
+    }
+}
+
+async fn start_websocket_generation(
+    socket: &mut WebSocket,
+    state: &TransportState,
+    active: &mut Option<ActiveWebSocketGeneration>,
+    id: String,
+    request: WebSocketGeneration,
+) -> bool {
+    if id.is_empty() || id.len() > 128 {
+        return send_websocket_error(
+            socket,
+            None,
+            "invalid_request",
+            "the request id is outside the supported bound",
+        )
+        .await;
+    }
+    if active.is_some() {
+        return send_websocket_error(
+            socket,
+            Some(&id),
+            "overloaded",
+            "only one request may be active in a session",
+        )
+        .await;
+    }
+    let Ok(internal_id) = state.websocket_request_ids.next() else {
+        return send_websocket_error(
+            socket,
+            Some(&id),
+            "internal",
+            "an internal server error occurred",
+        )
+        .await;
+    };
+    let cancellation = CancellationToken::new();
+    let Ok(context) = RequestContext::new(
+        internal_id,
+        cancellation.clone(),
+        Some(Duration::from_secs(300)),
+    ) else {
+        return send_websocket_error(
+            socket,
+            Some(&id),
+            "internal",
+            "an internal server error occurred",
+        )
+        .await;
+    };
+    match state.engine.generate(request.into_generation(), context) {
+        Ok(events) => {
+            *active = Some(ActiveWebSocketGeneration {
+                id,
+                cancellation,
+                events,
+                usage: None,
+            });
+            true
+        }
+        Err(error) => {
+            let (_, code, message) = engine_error(error);
+            send_websocket_error(socket, Some(&id), code, message).await
+        }
+    }
+}
+
+async fn handle_websocket_event(
+    socket: &mut WebSocket,
+    active: &mut Option<ActiveWebSocketGeneration>,
+    event: Option<Result<GenerationEvent, EngineError>>,
+) -> bool {
+    match event {
+        Some(Ok(GenerationEvent::Delta(delta))) => {
+            let Some(request) = active.as_ref() else {
+                return false;
+            };
+            send_websocket(
+                socket,
+                &WebSocketServerMessage::Delta {
+                    id: &request.id,
+                    delta: &delta,
+                },
+            )
+            .await
+            .is_ok()
+        }
+        Some(Ok(GenerationEvent::Usage(usage))) => {
+            let Some(request) = active.as_mut() else {
+                return false;
+            };
+            request.usage = Some(usage);
+            true
+        }
+        Some(Ok(GenerationEvent::Finished(reason))) => {
+            let Some(request) = active.take() else {
+                return false;
+            };
+            let Some(usage) = request.usage else {
+                return send_websocket_error(
+                    socket,
+                    Some(&request.id),
+                    "upstream_protocol",
+                    "the local runtime ended unexpectedly",
+                )
+                .await;
+            };
+            send_websocket(
+                socket,
+                &WebSocketServerMessage::Final {
+                    id: &request.id,
+                    finish_reason: finish_reason(reason),
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                },
+            )
+            .await
+            .is_ok()
+        }
+        Some(Err(error)) => {
+            let Some(request) = active.take() else {
+                return false;
+            };
+            let (_, code, message) = engine_error(error);
+            send_websocket_error(socket, Some(&request.id), code, message).await
+        }
+        None => {
+            let id = active.take().map(|request| request.id);
+            send_websocket_error(
+                socket,
+                id.as_deref(),
+                "upstream_protocol",
+                "the local runtime ended unexpectedly",
+            )
+            .await
+        }
+    }
+}
+
+fn cancel_active(active: &mut Option<ActiveWebSocketGeneration>) {
+    if let Some(request) = active.take() {
+        let _ = request.cancellation.cancel();
+    }
+}
+
+async fn send_websocket(
+    socket: &mut WebSocket,
+    message: &WebSocketServerMessage<'_>,
+) -> Result<(), ()> {
+    let text = serde_json::to_string(message).map_err(|_| ())?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_websocket_error(
+    socket: &mut WebSocket,
+    id: Option<&str>,
+    code: &'static str,
+    message: &'static str,
+) -> bool {
+    send_websocket(socket, &WebSocketServerMessage::Error { id, code, message })
+        .await
+        .is_ok()
 }
 
 async fn pending_status() -> Json<PendingStatusBody> {
@@ -647,7 +1427,10 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         future,
+        net::SocketAddr,
+        pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -662,13 +1445,23 @@ mod tests {
         response::Response,
         routing::get,
     };
+    use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
-    use impossible_server_core::{CancellationToken, RequestContext, ServerLimits};
+    use impossible_inferences_domain::{
+        CURATED_MODEL_ID, FinishReason, GenerationEvent, GenerationInput, GenerationRequest,
+        TokenUsage,
+    };
+    use impossible_inferences_engine::{EngineError, EngineStatus};
+    use impossible_server_core::{CancellationToken, RequestContext, RequestStop, ServerLimits};
     use impossible_server_testkit::reserve_loopback_listener;
-    use tokio::{net::TcpStream, sync::Notify};
+    use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientWebSocketMessage};
     use tower::ServiceExt;
 
-    use super::{InferenceServer, PendingInference, ShutdownFuture, Workload, WorkloadContext};
+    use super::{
+        EngineEventStream, EngineFuture, InferenceEngine, InferenceServer, LocalInference,
+        PendingInference, ShutdownFuture, Workload, WorkloadContext,
+    };
 
     fn test_limits(
         max_request_bytes: usize,
@@ -1036,6 +1829,367 @@ mod tests {
         let server = InferenceServer::new(PendingInference);
         let join = tokio::spawn(server.serve(listener, token));
         let _ = stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeInferenceEngine {
+        cancelled: Arc<Notify>,
+        observed_cancellation: Arc<AtomicBool>,
+    }
+
+    impl InferenceEngine for FakeInferenceEngine {
+        fn status(&self) -> EngineFuture<'_, EngineStatus> {
+            Box::pin(async {
+                EngineStatus {
+                    ready: true,
+                    runtime: "running",
+                    model: "loaded",
+                    profile: CURATED_MODEL_ID,
+                }
+            })
+        }
+
+        fn generate(
+            &self,
+            request: GenerationRequest,
+            context: RequestContext,
+        ) -> Result<Box<dyn EngineEventStream>, EngineError> {
+            if request.model != CURATED_MODEL_ID {
+                return Err(EngineError::InvalidRequest("model unavailable"));
+            }
+            let slow = matches!(
+                &request.input,
+                GenerationInput::Completion { prompt } if prompt == "slow"
+            );
+            let events = if slow {
+                VecDeque::new()
+            } else {
+                VecDeque::from([
+                    Ok(GenerationEvent::Delta("hel".to_owned())),
+                    Ok(GenerationEvent::Delta("lo".to_owned())),
+                    Ok(GenerationEvent::Usage(TokenUsage {
+                        prompt_tokens: 2,
+                        completion_tokens: 2,
+                        total_tokens: 4,
+                    })),
+                    Ok(GenerationEvent::Finished(FinishReason::Stop)),
+                ])
+            };
+            Ok(Box::new(FakeEventStream {
+                events,
+                context,
+                cancelled: self.cancelled.clone(),
+                observed_cancellation: self.observed_cancellation.clone(),
+                slow,
+                terminal: false,
+            }))
+        }
+
+        fn shutdown(&self) -> EngineFuture<'_, Result<(), EngineError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct FakeEventStream {
+        events: VecDeque<Result<GenerationEvent, EngineError>>,
+        context: RequestContext,
+        cancelled: Arc<Notify>,
+        observed_cancellation: Arc<AtomicBool>,
+        slow: bool,
+        terminal: bool,
+    }
+
+    impl Drop for FakeEventStream {
+        fn drop(&mut self) {
+            if self.context.cancellation().is_cancelled() {
+                self.observed_cancellation.store(true, Ordering::Release);
+                self.cancelled.notify_one();
+            }
+        }
+    }
+
+    impl EngineEventStream for FakeEventStream {
+        fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Option<Result<GenerationEvent, EngineError>>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if self.terminal {
+                    return None;
+                }
+                if self.slow {
+                    let stop = self.context.stopped().await;
+                    self.observed_cancellation.store(true, Ordering::Release);
+                    self.cancelled.notify_one();
+                    self.terminal = true;
+                    return Some(Err(match stop {
+                        RequestStop::Cancelled => EngineError::Cancelled,
+                        RequestStop::DeadlineExceeded => EngineError::DeadlineExceeded,
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.events.pop_front()
+            })
+        }
+    }
+
+    async fn spawn_transport_server(
+        limits: ServerLimits,
+    ) -> Result<
+        (
+            SocketAddr,
+            CancellationToken,
+            JoinHandle<std::io::Result<()>>,
+            FakeInferenceEngine,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = reserve_loopback_listener().await?;
+        let address = listener.local_addr()?;
+        let shutdown = CancellationToken::new();
+        let engine = FakeInferenceEngine::default();
+        let server = InferenceServer::with_limits(LocalInference::new(engine.clone()), limits);
+        let join = tokio::spawn(server.serve(listener, shutdown.clone()));
+        Ok((address, shutdown, join, engine))
+    }
+
+    fn transport_limits() -> Result<ServerLimits, Box<dyn std::error::Error>> {
+        test_limits(
+            1_024,
+            4,
+            2,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        )
+    }
+
+    async fn wait_for_fake_cancellation(
+        engine: &FakeInferenceEngine,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !engine.observed_cancellation.load(Ordering::Acquire) {
+            tokio::time::timeout(Duration::from_secs(1), engine.cancelled.notified())
+                .await
+                .map_err(|_| "generation cancellation was not observed")?;
+        }
+        Ok(())
+    }
+
+    async fn assert_http_failures(
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let malformed = client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .body("{")
+            .send()
+            .await?;
+        assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(malformed.text().await?.contains("invalid_request"));
+
+        let unsupported = client
+            .post(endpoint)
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "prompt": "hello",
+                "tools": []
+            }))
+            .send()
+            .await?;
+        assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let oversized = client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .body("x".repeat(1_025))
+            .send()
+            .await?;
+        assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let slow = client
+            .post(endpoint)
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "prompt": "slow"
+            }))
+            .send()
+            .await?;
+        assert_eq!(slow.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_network_http_json_sse_validation_and_disconnect_are_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, shutdown, join, _engine) =
+            spawn_transport_server(transport_limits()?).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let endpoint = format!("http://{address}/v1/completions");
+        let response = client
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "prompt": "hello",
+                "max_tokens": 8
+            }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.headers().contains_key("x-request-id"));
+        let json: serde_json::Value = response.json().await?;
+        assert_eq!(json["choices"][0]["text"], "hello");
+        assert_eq!(json["usage"]["total_tokens"], 4);
+
+        let chat: serde_json::Value = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(chat["choices"][0]["message"]["content"], "hello");
+        assert_eq!(chat["choices"][0]["message"]["role"], "assistant");
+
+        let response = client
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "model": CURATED_MODEL_ID,
+                "prompt": "hello",
+                "stream": true
+            }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut bytes = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(1), bytes.next())
+            .await
+            .map_err(|_| "SSE first chunk timed out")?
+            .ok_or("SSE response ended before its first chunk")??;
+        let first = String::from_utf8(first.to_vec())?;
+        assert!(first.contains("hel"));
+        assert!(!first.contains("[DONE]"));
+        let mut remainder = String::new();
+        while let Some(chunk) = bytes.next().await {
+            remainder.push_str(&String::from_utf8(chunk?.to_vec())?);
+        }
+        assert!(remainder.contains("lo"));
+        assert!(remainder.contains("[DONE]"));
+
+        assert_http_failures(&client, &endpoint).await?;
+
+        let _ = shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .map_err(|_| "transport server shutdown timed out")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_network_websocket_streams_rejects_binary_and_cancels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, shutdown, join, engine) = spawn_transport_server(transport_limits()?).await?;
+        let (mut socket, response) = connect_async(format!("ws://{address}/v1/ws")).await?;
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let ready = socket.next().await.ok_or("missing ready message")??;
+        assert!(ready.to_text()?.contains("\"type\":\"ready\""));
+
+        socket
+            .send(ClientWebSocketMessage::Text(
+                serde_json::json!({
+                    "type": "start",
+                    "id": "one",
+                    "request": {
+                        "mode": "completion",
+                        "model": CURATED_MODEL_ID,
+                        "prompt": "hello"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        let mut messages = Vec::new();
+        while messages.len() < 3 {
+            messages.push(
+                socket
+                    .next()
+                    .await
+                    .ok_or("WebSocket generation ended early")??
+                    .into_text()?
+                    .to_string(),
+            );
+        }
+        assert!(messages[0].contains("\"type\":\"delta\""));
+        assert!(messages[1].contains("\"type\":\"delta\""));
+        assert!(messages[2].contains("\"type\":\"final\""));
+        assert!(messages[2].contains("\"total_tokens\":4"));
+
+        socket
+            .send(ClientWebSocketMessage::Binary(vec![1, 2, 3].into()))
+            .await?;
+        let binary_error = socket.next().await.ok_or("missing binary error")??;
+        assert!(binary_error.to_text()?.contains("invalid_request"));
+
+        socket
+            .send(ClientWebSocketMessage::Text(
+                serde_json::json!({
+                    "type": "start",
+                    "id": "slow-one",
+                    "request": {
+                        "mode": "completion",
+                        "model": CURATED_MODEL_ID,
+                        "prompt": "slow"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        socket
+            .send(ClientWebSocketMessage::Text(
+                serde_json::json!({"type": "cancel", "id": "slow-one"})
+                    .to_string()
+                    .into(),
+            ))
+            .await?;
+        let cancelled = socket.next().await.ok_or("missing cancellation")??;
+        assert!(cancelled.to_text()?.contains("cancelled"));
+        wait_for_fake_cancellation(&engine).await?;
+        engine.observed_cancellation.store(false, Ordering::Release);
+        socket
+            .send(ClientWebSocketMessage::Text(
+                serde_json::json!({
+                    "type": "start",
+                    "id": "disconnect-one",
+                    "request": {
+                        "mode": "completion",
+                        "model": CURATED_MODEL_ID,
+                        "prompt": "slow"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(socket);
+        wait_for_fake_cancellation(&engine).await?;
+
+        let _ = shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), join).await???;
         Ok(())
     }

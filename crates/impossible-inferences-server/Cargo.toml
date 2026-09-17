@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 impossible-inferences-domain.workspace = true
 impossible-inferences-engine.workspace = true
 impossible-inferences-artifacts.workspace = true
@@ -22,6 +23,8 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 [dev-dependencies]
 http-body-util.workspace = true
 impossible-server-testkit.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
 tower.workspace = true
 
 [lints]
