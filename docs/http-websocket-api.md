@@ -21,6 +21,12 @@ process-local request ID, a normalized `stop` or `length` finish reason, and pro
 and total token usage. Unknown fields and unsupported content types are rejected rather than
 silently ignored.
 
+The curated model has a fixed 4096-token context. Before execution, the server conservatively
+accounts for prompt UTF-8 bytes, the fixed ChatML wrapper for chat requests, and `max_tokens`.
+This privacy-preserving local check does not run a second tokenizer and may reject a prompt near
+the actual tokenizer boundary. During generation, both non-empty runtime delta count and reported
+completion usage are independently limited by `max_tokens`.
+
 Set `stream` to `true` for `text/event-stream`. Ordered chunks contain text deltas, followed by a
 usage chunk, a finish chunk, and `data: [DONE]`. Slow consumers are bounded by the engine event
 queue. Client disconnect, server shutdown, and request deadline cancel or fence the generation.

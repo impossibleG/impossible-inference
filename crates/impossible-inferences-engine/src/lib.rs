@@ -19,7 +19,7 @@ use impossible_inferences_domain::{
     CURATED_MODEL_ID, ChatRole, FinishReason, GenerationEvent, GenerationInput, GenerationRequest,
     TokenUsage,
 };
-use impossible_server_core::{CancellationToken, RequestContext, RequestStop};
+use impossible_server_core::{CancellationToken, RequestContext, RequestIdSource, RequestStop};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Serialize;
 use serde_json::Value;
@@ -33,6 +33,10 @@ use tokio::{
 
 const MODEL_ALIAS: &str = CURATED_MODEL_ID;
 const MAX_SSE_LINE_BYTES: usize = 1_048_576;
+const MODEL_CONTEXT_TOKENS: usize = 4_096;
+const CHATML_MESSAGE_PREFIX: &str = "<|im_start|>";
+const CHATML_MESSAGE_SUFFIX: &str = "<|im_end|>\n";
+const CHATML_ASSISTANT_PREFIX: &str = "<|im_start|>assistant\n";
 const MAX_CAPTURED_LOG_CHUNKS: usize = 64;
 const CAPTURED_LOG_CHUNK_BYTES: usize = 1_024;
 const LAUNCH_ATTEMPTS: usize = 3;
@@ -421,6 +425,11 @@ impl GenerationEngine {
             .max_concurrent
             .checked_add(config.queue_capacity)
             .ok_or(EngineError::Configuration)?;
+        let startup_deadline = config
+            .startup_timeout
+            .checked_mul(u32::try_from(LAUNCH_ATTEMPTS).map_err(|_| EngineError::Configuration)?)
+            .and_then(|value| value.checked_add(Duration::from_secs(2)))
+            .ok_or(EngineError::Configuration)?;
         let engine = Self(Arc::new(EngineInner {
             assets,
             admitted: Arc::new(Semaphore::new(admitted_capacity)),
@@ -431,7 +440,17 @@ impl GenerationEngine {
             lifecycle: Mutex::new(Lifecycle::default()),
             shutdown: CancellationToken::new(),
         }));
-        engine.ensure_running().await?;
+        let startup_context = RequestContext::new(
+            RequestIdSource::default()
+                .next()
+                .map_err(|_| EngineError::Configuration)?,
+            CancellationToken::new(),
+            Some(startup_deadline),
+        )
+        .map_err(|_| EngineError::Configuration)?;
+        engine
+            .ensure_running(&startup_context, &CancellationToken::new())
+            .await?;
         Ok(engine)
     }
 
@@ -530,8 +549,8 @@ impl GenerationEngine {
                 permit.map_err(|_| EngineError::ShuttingDown)?
             }
         };
-        self.ensure_running().await?;
-        let (endpoint, bearer) = self.connection().await?;
+        self.ensure_running(&context, &disconnected).await?;
+        let (endpoint, bearer) = self.connection(&context, &disconnected).await?;
         let body = request.body();
         let remaining = context.remaining().ok_or(EngineError::Configuration)?;
         if remaining.is_zero() {
@@ -575,6 +594,7 @@ impl GenerationEngine {
         let mut finish = None;
         let mut usage = None;
         let mut done = false;
+        let mut generated_deltas = 0_u32;
         loop {
             let next = tokio::select! {
                 biased;
@@ -614,6 +634,9 @@ impl GenerationEngine {
                 let value: Value =
                     serde_json::from_slice(data).map_err(|_| EngineError::RuntimeProtocol)?;
                 if let Some(parsed) = parse_usage(&value)? {
+                    if parsed.completion_tokens > request.max_tokens {
+                        return Err(EngineError::RuntimeProtocol);
+                    }
                     usage = Some(parsed);
                 }
                 if let Some(reason) = parse_finish_reason(&value)? {
@@ -622,6 +645,12 @@ impl GenerationEngine {
                 if let Some(delta) = request.delta(&value)?
                     && !delta.is_empty()
                 {
+                    generated_deltas = generated_deltas
+                        .checked_add(1)
+                        .ok_or(EngineError::RuntimeProtocol)?;
+                    if generated_deltas > request.max_tokens {
+                        return Err(EngineError::RuntimeProtocol);
+                    }
                     send_event(
                         sender,
                         GenerationEvent::Delta(delta.to_owned()),
@@ -657,8 +686,20 @@ impl GenerationEngine {
         .await
     }
 
-    async fn connection(&self) -> Result<(String, String), EngineError> {
-        let mut lifecycle = self.0.lifecycle.lock().await;
+    async fn connection(
+        &self,
+        context: &RequestContext,
+        disconnected: &CancellationToken,
+    ) -> Result<(String, String), EngineError> {
+        let lock = self.0.lifecycle.lock();
+        tokio::pin!(lock);
+        let mut lifecycle = tokio::select! {
+            biased;
+            stop = context.stopped() => return Err(map_stop(stop)),
+            () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+            () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+            guard = &mut lock => guard,
+        };
         let running = lifecycle
             .running
             .as_mut()
@@ -670,11 +711,23 @@ impl GenerationEngine {
         Ok((running.endpoint.clone(), running.bearer.clone()))
     }
 
-    async fn ensure_running(&self) -> Result<(), EngineError> {
+    async fn ensure_running(
+        &self,
+        context: &RequestContext,
+        disconnected: &CancellationToken,
+    ) -> Result<(), EngineError> {
         if self.0.shutdown.is_cancelled() {
             return Err(EngineError::ShuttingDown);
         }
-        let mut lifecycle = self.0.lifecycle.lock().await;
+        let lock = self.0.lifecycle.lock();
+        tokio::pin!(lock);
+        let mut lifecycle = tokio::select! {
+            biased;
+            stop = context.stopped() => return Err(map_stop(stop)),
+            () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+            () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+            guard = &mut lock => guard,
+        };
         if let Some(running) = lifecycle.running.as_mut() {
             if !running.child.try_exited()? {
                 return Ok(());
@@ -685,7 +738,13 @@ impl GenerationEngine {
             if attempt > 0 {
                 let shift = u32::try_from(attempt - 1).map_err(|_| EngineError::Configuration)?;
                 let millis = 250_u64.checked_shl(shift).unwrap_or(1_000).min(1_000);
-                sleep(Duration::from_millis(millis)).await;
+                tokio::select! {
+                    biased;
+                    stop = context.stopped() => return Err(map_stop(stop)),
+                    () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+                    () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+                    () = sleep(Duration::from_millis(millis)) => {}
+                }
             }
             let port = reserve_ephemeral_port()?;
             let bearer = ephemeral_bearer()?;
@@ -694,15 +753,23 @@ impl GenerationEngine {
                 port,
                 bearer: bearer.clone(),
             };
-            let Ok(mut child) = self.0.launcher.launch(&spec).await else {
+            let launch = self.0.launcher.launch(&spec);
+            tokio::pin!(launch);
+            let launched = tokio::select! {
+                biased;
+                stop = context.stopped() => return Err(map_stop(stop)),
+                () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+                () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+                result = &mut launch => result,
+            };
+            let Ok(mut child) = launched else {
                 continue;
             };
             let endpoint = format!("http://127.0.0.1:{port}");
-            if self
-                .wait_until_ready(&mut *child, &endpoint, &bearer)
-                .await
-                .is_ok()
-            {
+            let readiness = self
+                .wait_until_ready(&mut *child, &endpoint, &bearer, context, disconnected)
+                .await;
+            if readiness.is_ok() {
                 lifecycle.running = Some(RunningSidecar {
                     child,
                     endpoint,
@@ -710,7 +777,22 @@ impl GenerationEngine {
                 });
                 return Ok(());
             }
-            let _ = child.terminate(self.0.config.shutdown_timeout).await;
+            let readiness = readiness.err().ok_or(EngineError::RuntimeUnavailable)?;
+            let terminate = child.terminate(self.0.config.shutdown_timeout);
+            tokio::pin!(terminate);
+            tokio::select! {
+                biased;
+                stop = context.stopped() => return Err(map_stop(stop)),
+                () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+                () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+                _ = &mut terminate => {}
+            }
+            if matches!(
+                readiness,
+                EngineError::Cancelled | EngineError::DeadlineExceeded | EngineError::ShuttingDown
+            ) {
+                return Err(readiness);
+            }
         }
         Err(EngineError::RuntimeUnavailable)
     }
@@ -720,20 +802,30 @@ impl GenerationEngine {
         child: &mut dyn ManagedChild,
         endpoint: &str,
         bearer: &str,
+        context: &RequestContext,
+        disconnected: &CancellationToken,
     ) -> Result<(), EngineError> {
         let deadline = Instant::now() + self.0.config.startup_timeout;
         loop {
             if child.try_exited()? {
                 return Err(EngineError::RuntimeUnavailable);
             }
-            if let Ok(response) = self
+            let probe = self
                 .0
                 .client
                 .get(format!("{endpoint}/health"))
                 .bearer_auth(bearer)
                 .timeout(Duration::from_millis(500))
-                .send()
-                .await
+                .send();
+            tokio::pin!(probe);
+            let result = tokio::select! {
+                biased;
+                stop = context.stopped() => return Err(map_stop(stop)),
+                () = disconnected.cancelled() => return Err(EngineError::Cancelled),
+                () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
+                result = &mut probe => result,
+            };
+            if let Ok(response) = result
                 && response.status() == StatusCode::OK
             {
                 return Ok(());
@@ -742,6 +834,9 @@ impl GenerationEngine {
                 return Err(EngineError::RuntimeUnavailable);
             }
             tokio::select! {
+                biased;
+                stop = context.stopped() => return Err(map_stop(stop)),
+                () = disconnected.cancelled() => return Err(EngineError::Cancelled),
                 () = self.0.shutdown.cancelled() => return Err(EngineError::ShuttingDown),
                 () = sleep(Duration::from_millis(50)) => {}
             }
@@ -889,6 +984,17 @@ fn normalize_request(
             "prompt exceeds the supported bound",
         ));
     }
+    let conservative_prompt_tokens = conservative_prompt_tokens(&request.input)?;
+    let requested_output = usize::try_from(request.max_tokens)
+        .map_err(|_| EngineError::InvalidRequest("max_tokens is outside the supported bound"))?;
+    if conservative_prompt_tokens
+        .checked_add(requested_output)
+        .is_none_or(|total| total > MODEL_CONTEXT_TOKENS)
+    {
+        return Err(EngineError::InvalidRequest(
+            "prompt and requested output exceed the model context",
+        ));
+    }
     Ok(NormalizedRequest {
         input: request.input,
         max_tokens: request.max_tokens,
@@ -901,6 +1007,32 @@ fn normalize_request(
         seed: request.seed,
         stop: request.stop,
     })
+}
+
+fn conservative_prompt_tokens(input: &GenerationInput) -> Result<usize, EngineError> {
+    match input {
+        GenerationInput::Completion { prompt } => Ok(prompt.len()),
+        GenerationInput::Chat { messages } => {
+            messages
+                .iter()
+                .try_fold(CHATML_ASSISTANT_PREFIX.len(), |total, message| {
+                    let role = match message.role {
+                        ChatRole::System => "system",
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    };
+                    total
+                        .checked_add(CHATML_MESSAGE_PREFIX.len())
+                        .and_then(|value| value.checked_add(role.len()))
+                        .and_then(|value| value.checked_add(1))
+                        .and_then(|value| value.checked_add(message.content.len()))
+                        .and_then(|value| value.checked_add(CHATML_MESSAGE_SUFFIX.len()))
+                        .ok_or(EngineError::InvalidRequest(
+                            "chat messages are outside the supported bound",
+                        ))
+                })
+        }
+    }
 }
 
 fn parse_usage(value: &Value) -> Result<Option<TokenUsage>, EngineError> {
@@ -995,6 +1127,7 @@ fn ephemeral_bearer() -> Result<String, EngineError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Write,
         path::PathBuf,
         sync::{
             Arc,
@@ -1021,7 +1154,8 @@ mod tests {
 
     use super::{
         BoxFuture, EngineConfig, EngineError, GenerationEngine, LaunchAssets, LaunchSpec,
-        ManagedChild, SidecarLauncher, build_command, ephemeral_bearer, normalize_request,
+        ManagedChild, SidecarLauncher, build_command, conservative_prompt_tokens, ephemeral_bearer,
+        normalize_request,
     };
 
     #[derive(Default)]
@@ -1029,6 +1163,7 @@ mod tests {
         launches: AtomicUsize,
         terminations: AtomicUsize,
         stall: AtomicBool,
+        unhealthy: AtomicBool,
         servers: Mutex<Vec<CancellationToken>>,
         requests: Mutex<Vec<Value>>,
     }
@@ -1074,7 +1209,7 @@ mod tests {
                     requests: self.control.clone(),
                 };
                 let router = Router::new()
-                    .route("/health", get(|| async { StatusCode::OK }))
+                    .route("/health", get(fake_health))
                     .route("/v1/completions", post(fake_generation))
                     .route("/v1/chat/completions", post(fake_generation))
                     .with_state(state);
@@ -1090,6 +1225,14 @@ mod tests {
                     control: self.control.clone(),
                 }) as Box<dyn ManagedChild>)
             })
+        }
+    }
+
+    async fn fake_health(State(state): State<FakeState>) -> StatusCode {
+        if state.requests.unhealthy.load(Ordering::Acquire) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
         }
     }
 
@@ -1110,17 +1253,43 @@ mod tests {
         if state.requests.stall.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        let prompt = request.get("prompt").and_then(Value::as_str);
+        let delta_overflow = prompt == Some("delta-overflow");
+        let usage_overflow = prompt == Some("usage-overflow");
         let delta_field = if request.get("messages").is_some() {
             "\"delta\":{\"content\":\"hello\"}"
         } else {
             "\"text\":\"hello\""
         };
-        let body = format!(
+        let mut body = format!(
             "data: {{\"choices\":[{{{delta_field},\"finish_reason\":null}}]}}\n\n\
-             data: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n\n\
-             data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}}}\n\n\
-             data: [DONE]\n\n"
+             "
         );
+        if delta_overflow
+            && write!(
+                body,
+                "data: {{\"choices\":[{{{delta_field},\"finish_reason\":null}}]}}\n\n"
+            )
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let completion_tokens = if delta_overflow || usage_overflow {
+            2
+        } else {
+            1
+        };
+        if write!(
+            body,
+            "data: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}\n\n\
+             data: [DONE]\n\n",
+            3 + completion_tokens
+        )
+        .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         Response::builder()
             .header("content-type", "text/event-stream")
             .body(Body::from(body))
@@ -1223,6 +1392,41 @@ mod tests {
             prompt: "x".repeat(65_537),
         };
         assert!(normalize_request(oversized, &EngineConfig::default()).is_err());
+
+        let mut boundary = completion();
+        boundary.input = GenerationInput::Completion {
+            prompt: "x".repeat(4_096 - 16),
+        };
+        assert!(normalize_request(boundary.clone(), &EngineConfig::default()).is_ok());
+        if let GenerationInput::Completion { prompt } = &mut boundary.input {
+            prompt.push('x');
+        }
+        assert!(matches!(
+            normalize_request(boundary, &EngineConfig::default()),
+            Err(EngineError::InvalidRequest(
+                "prompt and requested output exceed the model context"
+            ))
+        ));
+
+        let mut chat_boundary = completion();
+        let empty_chat = GenerationInput::Chat {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: String::new(),
+            }],
+        };
+        let chat_overhead = conservative_prompt_tokens(&empty_chat)?;
+        chat_boundary.input = GenerationInput::Chat {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "x".repeat(4_096 - 16 - chat_overhead),
+            }],
+        };
+        assert!(normalize_request(chat_boundary.clone(), &EngineConfig::default()).is_ok());
+        if let GenerationInput::Chat { messages } = &mut chat_boundary.input {
+            messages[0].content.push('x');
+        }
+        assert!(normalize_request(chat_boundary, &EngineConfig::default()).is_err());
         Ok(())
     }
 
@@ -1395,6 +1599,63 @@ mod tests {
         assert_eq!(cancelled_event, Err(EngineError::Cancelled));
         assert!(cancelled.recv().await.is_none());
         control.stall.store(false, Ordering::Release);
+        engine.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_restart_honors_request_deadline_and_releases_lane()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, control) = engine(EngineConfig {
+            startup_timeout: Duration::from_secs(2),
+            ..EngineConfig::default()
+        })
+        .await?;
+        control.crash_latest().await?;
+        control.unhealthy.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut deadline = engine.generate(completion(), context(Duration::from_millis(30))?)?;
+        let event = timeout(Duration::from_millis(500), deadline.recv())
+            .await?
+            .ok_or("deadline stream closed without an event")?;
+        assert_eq!(event, Err(EngineError::DeadlineExceeded));
+
+        control.unhealthy.store(false, Ordering::Release);
+        let mut recovered = engine.generate(completion(), context(Duration::from_secs(2))?)?;
+        assert_eq!(
+            timeout(Duration::from_secs(1), recovered.recv())
+                .await?
+                .transpose()?,
+            Some(GenerationEvent::Delta("hello".to_owned()))
+        );
+        drop(recovered);
+        engine.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_output_limits_do_not_trust_sidecar_events_or_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, _) = engine(EngineConfig {
+            startup_timeout: Duration::from_secs(1),
+            ..EngineConfig::default()
+        })
+        .await?;
+        for prompt in ["delta-overflow", "usage-overflow"] {
+            let mut request = completion();
+            request.input = GenerationInput::Completion {
+                prompt: prompt.to_owned(),
+            };
+            request.max_tokens = 1;
+            let mut stream = engine.generate(request, context(Duration::from_secs(2))?)?;
+            assert_eq!(
+                stream.recv().await.transpose()?,
+                Some(GenerationEvent::Delta("hello".to_owned()))
+            );
+            assert_eq!(stream.recv().await, Some(Err(EngineError::RuntimeProtocol)));
+            assert!(stream.recv().await.is_none());
+        }
         engine.shutdown().await?;
         Ok(())
     }

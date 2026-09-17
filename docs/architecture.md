@@ -21,5 +21,11 @@ release identity; its exact reviewed tree hash is pinned in `foundation-sync.jso
 The implemented engine verifies the complete extracted runtime tree against the retained pinned
 archive, then owns one llama.cpp child on an ephemeral loopback port. It uses a per-process bearer,
 bounded captured diagnostics, explicit restart/backoff, fixed Qwen ChatML, and one bounded CPU
-generation lane. The public server currently adapts that engine to non-streaming HTTP, incremental
-SSE, and versioned WebSocket sessions. gRPC and MCP adapters remain pending.
+generation lane. Startup, restart, readiness, backoff, and lifecycle-lock waits are fenced by the
+request deadline and cancellation signal. The fixed model context is 4096 tokens. Admission uses a
+deliberately conservative UTF-8-byte upper bound for prompt text, includes the exact ChatML wrapper
+and requested output allowance, and can reject a prompt near the true tokenizer boundary. Runtime
+delta count and reported completion usage are independently checked against `max_tokens`.
+
+The public server currently adapts that engine to non-streaming HTTP, incremental SSE, and
+versioned WebSocket sessions. gRPC and MCP adapters remain pending.
