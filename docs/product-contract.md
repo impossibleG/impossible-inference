@@ -1,8 +1,8 @@
-# Impossible Inferences v0.1 product contract
+# Impossible Inference v0.1 product contract
 
 ## Product promise
 
-Impossible Inferences is a ready-made, self-hosted token-completion server. A supported user runs
+Impossible Inference is a ready-made, self-hosted token-completion server. A supported user runs
 one setup command and one serve command. Setup downloads, verifies, and installs one curated GGUF
 instruction model and a pinned llama.cpp-compatible CPU runtime. Normal operation is local and
 offline after installation and does not require a paid inference API.

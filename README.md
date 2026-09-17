@@ -1,6 +1,10 @@
-# Impossible Inferences
+<p align="center">
+  <img src="docs/assets/impossible-inference-header.png" alt="Impossible G — Inference" width="860">
+</p>
 
-Impossible Inferences is a ready-made, self-hosted token-completion server for local open models.
+# Impossible Inference
+
+Impossible Inference is a ready-made, self-hosted token-completion server for local open models.
 Version 0.1 provides one curated CPU inference path with automatic verified setup, offline
 operation after installation, OpenAI-compatible completion and chat endpoints, SSE token
 streaming, WebSocket cancellation, unary and streaming gRPC, and bounded MCP tools.

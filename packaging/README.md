@@ -1,6 +1,6 @@
-# Impossible Inferences native package
+# Impossible Inference native package
 
-This package contains the Impossible Inferences server binary and its exact v0.1 API and artifact
+This package contains the Impossible Inference server binary and its exact v0.1 API and artifact
 contracts. It does not contain a model or native inference runtime.
 
 Run one setup command, then one serve command from this directory:

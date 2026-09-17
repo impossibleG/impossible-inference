@@ -1,4 +1,4 @@
-//! Bounded HTTP control plane for Impossible Inferences.
+//! Bounded HTTP control plane for Impossible Inference.
 
 mod grpc;
 mod mcp;

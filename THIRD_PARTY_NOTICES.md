@@ -2,7 +2,7 @@
 
 Generated from the locked Rust dependency graph by `scripts/generate-third-party-notices.ps1`. Do not edit by hand.
 
-Impossible Inferences is distributed under MIT OR Apache-2.0. The inventory below records each dependency's declared license; complete mapped texts are in `THIRD_PARTY_LICENSES.txt`. `cargo deny` validates the graph against `deny.toml`.
+Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below records each dependency's declared license; complete mapped texts are in `THIRD_PARTY_LICENSES.txt`. `cargo deny` validates the graph against `deny.toml`.
 
 | Package | Version | Declared license | Source |
 | --- | --- | --- | --- |

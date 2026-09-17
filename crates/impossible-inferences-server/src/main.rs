@@ -1,4 +1,4 @@
-//! Command-line entry point for Impossible Inferences.
+//! Command-line entry point for Impossible Inference.
 
 use std::{
     fs,

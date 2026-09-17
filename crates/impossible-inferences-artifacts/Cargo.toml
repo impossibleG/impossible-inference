@@ -1,6 +1,6 @@
 [package]
 name = "impossible-inferences-artifacts"
-description = "Verified curated runtime and model installation for Impossible Inferences"
+description = "Verified curated runtime and model installation for Impossible Inference"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

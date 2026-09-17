@@ -1,6 +1,6 @@
 [package]
 name = "impossible-inferences-server"
-description = "Local-first bounded server shell for Impossible Inferences"
+description = "Local-first bounded server shell for Impossible Inference"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
