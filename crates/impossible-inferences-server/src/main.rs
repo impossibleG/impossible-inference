@@ -8,6 +8,7 @@ use std::{
 };
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use impossible_inferences_artifacts::{SetupMode, Verification, inspect, setup};
 use impossible_inferences_server::{InferenceServer, PendingInference};
 use impossible_server_core::{CancellationToken, ServerLimits};
 use serde::Deserialize;
@@ -20,6 +21,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 const MAX_CONFIG_BYTES: u64 = 65_536;
+const DEFAULT_ARTIFACT_ROOT: &str = "runtime-artifacts";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +36,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Download and verify the curated runtime and model.
+    Setup(SetupArgs),
     /// Start the local HTTP control plane.
     Serve(ConfigArgs),
     /// Validate effective configuration without opening a listener.
@@ -43,10 +47,27 @@ enum Command {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+struct SetupArgs {
+    /// Managed installation root. Models and runtimes remain ignored by Git.
+    #[arg(
+        long,
+        env = "IMPOSSIBLE_INFERENCES_ARTIFACT_ROOT",
+        default_value = DEFAULT_ARTIFACT_ROOT
+    )]
+    artifact_root: PathBuf,
+    /// Verify and recover exclusively from already-downloaded local artifacts.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
 struct ConfigArgs {
     /// Optional bounded JSON configuration file.
     #[arg(long, env = "IMPOSSIBLE_INFERENCES_CONFIG")]
     config: Option<PathBuf>,
+    /// Managed installation root. Ordinary serve never downloads into it.
+    #[arg(long, env = "IMPOSSIBLE_INFERENCES_ARTIFACT_ROOT")]
+    artifact_root: Option<PathBuf>,
     /// Loopback bind address. Command-line values override environment and file values.
     #[arg(long, env = "IMPOSSIBLE_INFERENCES_BIND")]
     bind: Option<SocketAddr>,
@@ -70,6 +91,7 @@ struct ConfigArgs {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    artifact_root: Option<PathBuf>,
     bind: Option<SocketAddr>,
     max_request_bytes: Option<usize>,
     queue_capacity: Option<usize>,
@@ -78,10 +100,11 @@ struct FileConfig {
     shutdown_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EffectiveConfig {
     bind: SocketAddr,
     limits: ServerLimits,
+    artifact_root: PathBuf,
 }
 
 impl ConfigArgs {
@@ -117,7 +140,19 @@ impl ConfigArgs {
                     .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS),
             ),
         )?;
-        Ok(EffectiveConfig { bind, limits })
+        let artifact_root = self
+            .artifact_root
+            .clone()
+            .or(file.artifact_root)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_ARTIFACT_ROOT));
+        if artifact_root.as_os_str().is_empty() {
+            return Err("artifact root must not be empty".into());
+        }
+        Ok(EffectiveConfig {
+            bind,
+            limits,
+            artifact_root,
+        })
     }
 }
 
@@ -133,16 +168,34 @@ fn read_config(path: &Path) -> Result<FileConfig, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
+        Command::Setup(arguments) => {
+            let mode = if arguments.offline {
+                SetupMode::Offline
+            } else {
+                SetupMode::Online
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&setup(&arguments.artifact_root, mode)?)?
+            );
+            Ok(())
+        }
         Command::Serve(arguments) => serve(arguments.resolve()?).await,
         Command::Doctor(arguments) => {
-            let _ = arguments.resolve()?;
-            println!(r#"{{"schema_version":1,"status":"ok","ready":false}}"#);
+            let config = arguments.resolve()?;
+            println!(
+                "{}",
+                serde_json::to_string(&inspect(&config.artifact_root, Verification::Full))?
+            );
             Ok(())
         }
         Command::Status(arguments) => {
-            let _ = arguments.resolve()?;
             println!(
-                r#"{{"schema_version":1,"status":"not_ready","runtime":"not_installed","model":"not_installed"}}"#
+                "{}",
+                serde_json::to_string(&inspect(
+                    &arguments.resolve()?.artifact_root,
+                    Verification::Fast,
+                ))?
             );
             Ok(())
         }
@@ -182,6 +235,10 @@ mod tests {
         assert!(effective.bind.ip().is_loopback());
         assert_eq!(effective.bind.port(), 8080);
         assert_eq!(effective.limits.max_request_bytes(), 1_048_576);
+        assert_eq!(
+            effective.artifact_root,
+            std::path::Path::new("runtime-artifacts")
+        );
         Ok(())
     }
 

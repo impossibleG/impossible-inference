@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "product": "impossible-inferences-artifacts",
+  "profile_id": "qwen2.5-0.5b-instruct-q4-k-m",
+  "model": {
+    "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true",
+    "size": 491400032,
+    "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+    "license": "Apache-2.0",
+    "license_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/9217f5db79a29953eb74d5343926648285ec7e67/LICENSE"
+  },
+  "runtime": {
+    "project": "ggml-org/llama.cpp",
+    "release_tag": "b10964",
+    "semantic_version": "v0.4.1",
+    "source_commit": "b29c606e28a01b1bc8c1351026a0fa6e616bf6c4",
+    "license": "MIT",
+    "license_url": "https://github.com/ggml-org/llama.cpp/blob/b29c606e28a01b1bc8c1351026a0fa6e616bf6c4/LICENSE",
+    "platforms": [
+      {
+        "target": "x86_64-pc-windows-msvc",
+        "archive_format": "zip",
+        "filename": "llama-b10964-bin-win-cpu-x64.zip",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10964/llama-b10964-bin-win-cpu-x64.zip",
+        "size": 18427629,
+        "sha256": "917f39c076402c421224824607397af20f53625a60defc20e8dd22446bf4c5d7",
+        "strip_prefix": "",
+        "executable": "llama-server.exe"
+      },
+      {
+        "target": "x86_64-unknown-linux-gnu",
+        "archive_format": "tar_gz",
+        "filename": "llama-b10964-bin-ubuntu-x64.tar.gz",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10964/llama-b10964-bin-ubuntu-x64.tar.gz",
+        "size": 16825086,
+        "sha256": "9abf88aea48a55d0f80edb1ee20220b186848cca0b4e919d71518cfd7ca67443",
+        "strip_prefix": "llama-b10964",
+        "executable": "llama-server"
+      }
+    ]
+  }
+}

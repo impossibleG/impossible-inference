@@ -12,6 +12,7 @@ axum.workspace = true
 clap.workspace = true
 impossible-inferences-domain.workspace = true
 impossible-inferences-engine.workspace = true
+impossible-inferences-artifacts.workspace = true
 impossible-inferences-protocol.workspace = true
 impossible-server-core.workspace = true
 serde.workspace = true

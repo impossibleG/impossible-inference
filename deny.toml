@@ -15,8 +15,14 @@ include-dev = true
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
+    # rustls uses ISC-licensed cryptographic and certificate-validation components.
+    "ISC",
     "MIT",
     "Unicode-3.0",
+    # zlib-rs backs the reviewed archive decoder.
+    "Zlib",
+    # Mozilla's root-certificate data consumed by webpki-roots uses this license.
+    "CDLA-Permissive-2.0",
 ]
 exceptions = []
 
@@ -25,7 +31,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = []
-skip = []
+skip = [
+    # displaydoc and ICU have moved to syn 3 while the remaining proc-macro graph uses syn 2.
+    { name = "syn", version = "=3.0.6" },
+]
 skip-tree = []
 
 [sources]

@@ -18,6 +18,7 @@ this revision as a functional inference server.
 ```powershell
 cargo run -p impossible-inferences-server -- doctor
 cargo run -p impossible-inferences-server -- status
+cargo run -p impossible-inferences-server -- setup
 cargo run -p impossible-inferences-server -- serve
 ```
 
@@ -27,6 +28,12 @@ then safe default. Run `cargo run -p impossible-inferences-server -- serve --hel
 variables and limits. The current control plane exposes `/health/live`, `/health/ready`, `/metrics`,
 `/version`, `/v1/capabilities`, `/v1/models`, and `/status`; readiness remains false until a verified
 runtime and model are installed and the generation adapter is healthy.
+
+Setup pins and verifies the official llama.cpp `b10964` Windows/Linux x86-64 CPU runtime and the
+official Qwen2.5 0.5B Instruct Q4_K_M GGUF profile. It stages downloads under the ignored
+`runtime-artifacts/` directory and atomically promotes a complete installation. Run `setup
+--offline` to verify the retained runtime archive and model and reconstruct extracted runtime files
+without network access. `serve`, `doctor`, and `status` never download artifacts.
 
 The repository vendors the reviewed Impossible Server core and testkit as a deterministic source
 snapshot. That snapshot supplies bounded lifecycle, health, request, cancellation, and test
