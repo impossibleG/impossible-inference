@@ -5,6 +5,7 @@ members = [
     "crates/impossible-inferences-engine",
     "crates/impossible-inferences-server",
 ]
+exclude = ["vendor/impossible-server"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +18,8 @@ license = "MIT OR Apache-2.0"
 impossible-inferences-domain = { version = "=0.1.0", path = "crates/impossible-inferences-domain" }
 impossible-inferences-protocol = { version = "=0.1.0", path = "crates/impossible-inferences-protocol" }
 impossible-inferences-engine = { version = "=0.1.0", path = "crates/impossible-inferences-engine" }
+impossible-server-core = { version = "=0.1.0", path = "vendor/impossible-server/crates/impossible-server-core" }
+impossible-server-testkit = { version = "=0.1.0", path = "vendor/impossible-server/crates/impossible-server-testkit" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

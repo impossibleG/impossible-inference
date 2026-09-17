@@ -31,6 +31,8 @@ jobs:
         run: ./scripts/privacy-scan.ps1
       - shell: pwsh
         run: ./scripts/test-privacy-scan.ps1
+      - shell: pwsh
+        run: ./scripts/verify-foundation-snapshot.ps1
 
   supply-chain:
     runs-on: ubuntu-latest

@@ -14,6 +14,11 @@ non-goals.
 
 Bootstrap only. Do not treat this revision as a functional inference server.
 
+The repository vendors the reviewed Impossible Server core and testkit as a deterministic source
+snapshot. That snapshot supplies bounded lifecycle, health, request, cancellation, and test
+primitives. It does not contain HTTP, SSE, WebSocket, gRPC, MCP, automatic setup, or inference
+implementations; those remain product work tracked by this contract.
+
 ## License
 
 Licensed under either the Apache License 2.0 or the MIT License, at your option.

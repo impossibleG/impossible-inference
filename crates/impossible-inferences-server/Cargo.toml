@@ -10,6 +10,10 @@ publish = false
 impossible-inferences-domain.workspace = true
 impossible-inferences-engine.workspace = true
 impossible-inferences-protocol.workspace = true
+impossible-server-core.workspace = true
+
+[dev-dependencies]
+impossible-server-testkit.workspace = true
 
 [lints]
 workspace = true
