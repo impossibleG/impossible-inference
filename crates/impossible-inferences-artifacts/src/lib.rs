@@ -63,6 +63,62 @@ pub struct InstallStatus {
     pub reason: Option<&'static str>,
 }
 
+/// Fully verified local paths required to launch the curated inference runtime.
+///
+/// This value deliberately omits `Serialize` and redacts paths from `Debug` so diagnostics cannot
+/// disclose a user's filesystem layout.
+#[derive(Clone)]
+pub struct InstalledArtifacts {
+    profile: &'static str,
+    target: &'static str,
+    runtime_directory: PathBuf,
+    runtime_executable: PathBuf,
+    model_file: PathBuf,
+}
+
+impl fmt::Debug for InstalledArtifacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledArtifacts")
+            .field("profile", &self.profile)
+            .field("target", &self.target)
+            .field("paths", &"redacted")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledArtifacts {
+    /// Returns the stable curated profile identifier.
+    #[must_use]
+    pub const fn profile(&self) -> &'static str {
+        self.profile
+    }
+
+    /// Returns the supported Rust target identifier selected for this host.
+    #[must_use]
+    pub const fn target(&self) -> &'static str {
+        self.target
+    }
+
+    /// Returns the directory that must be the child runtime's working directory.
+    #[must_use]
+    pub fn runtime_directory(&self) -> &Path {
+        &self.runtime_directory
+    }
+
+    /// Returns the exact verified `llama-server` executable.
+    #[must_use]
+    pub fn runtime_executable(&self) -> &Path {
+        &self.runtime_executable
+    }
+
+    /// Returns the exact verified curated GGUF model.
+    #[must_use]
+    pub fn model_file(&self) -> &Path {
+        &self.model_file
+    }
+}
+
 impl InstallStatus {
     fn ready(profile: &'static str, target: &'static str) -> Self {
         Self {
@@ -360,6 +416,48 @@ pub fn inspect(root: &Path, verification: Verification) -> InstallStatus {
     }
 }
 
+/// Resolves the exact installed runtime and model after offline verification.
+///
+/// This function never creates a network client and never repairs or mutates the installation.
+///
+/// # Errors
+/// Returns a sanitized failure if the pinned installation is absent, redirected, or invalid.
+pub fn resolve_installed(
+    root: &Path,
+    verification: Verification,
+) -> Result<InstalledArtifacts, ArtifactError> {
+    let manifest = parse_manifest()?;
+    let target = host_target().ok_or(ArtifactError::UnsupportedPlatform)?;
+    let runtime = select_runtime(&manifest, target)?;
+    let current = root.join(CURRENT_DIRECTORY);
+    verify_current(&current, &manifest, runtime, verification)?;
+    let state = read_and_validate_state(&current, &manifest, runtime)?;
+    let canonical_current = fs::canonicalize(&current)?;
+    let runtime_executable = fs::canonicalize(current.join(&state.runtime_executable))?;
+    let model_file = fs::canonicalize(current.join(&state.model_file))?;
+    let runtime_directory = runtime_executable
+        .parent()
+        .ok_or(ArtifactError::Manifest(
+            "runtime executable has no directory",
+        ))?
+        .to_path_buf();
+    if !runtime_executable.starts_with(&canonical_current)
+        || !model_file.starts_with(&canonical_current)
+        || !runtime_directory.starts_with(&canonical_current)
+    {
+        return Err(ArtifactError::Manifest(
+            "installed paths escape managed root",
+        ));
+    }
+    Ok(InstalledArtifacts {
+        profile: profile_name(&manifest)?,
+        target: target_name(runtime)?,
+        runtime_directory,
+        runtime_executable,
+        model_file,
+    })
+}
+
 fn parse_manifest() -> Result<ArtifactManifest, ArtifactError> {
     let manifest: ArtifactManifest = serde_json::from_str(EMBEDDED_MANIFEST)
         .map_err(|_| ArtifactError::Manifest("JSON cannot be decoded"))?;
@@ -598,8 +696,17 @@ fn verify_current(
         verification,
         "model",
     )?;
-    if !directory.join(&state.runtime_executable).is_file() {
+    let executable = directory.join(&state.runtime_executable);
+    let executable_metadata = fs::symlink_metadata(&executable)?;
+    if executable_metadata.file_type().is_symlink() || !executable_metadata.is_file() {
         return Err(ArtifactError::Integrity("runtime"));
+    }
+    if verification == Verification::Full {
+        verify_runtime_tree(
+            &directory.join(&state.runtime_archive),
+            &directory.join("runtime"),
+            runtime,
+        )?;
     }
     Ok(())
 }
@@ -620,6 +727,9 @@ fn read_and_validate_state(
         || state.runtime_sha256 != runtime.sha256
         || state.model_revision != manifest.model.revision
         || state.model_sha256 != manifest.model.sha256
+        || state.runtime_archive != format!("downloads/{}", runtime.filename)
+        || state.runtime_executable != format!("runtime/{}", runtime.executable)
+        || state.model_file != format!("model/{}", manifest.model.filename)
         || safe_relative(Path::new(&state.runtime_archive)).is_none()
         || safe_relative(Path::new(&state.runtime_executable)).is_none()
         || safe_relative(Path::new(&state.model_file)).is_none()
@@ -627,6 +737,162 @@ fn read_and_validate_state(
         return Err(ArtifactError::Manifest("install state identity mismatch"));
     }
     Ok(state)
+}
+
+fn verify_runtime_tree(
+    archive: &Path,
+    installed: &Path,
+    runtime: &RuntimeArtifact,
+) -> Result<(), ArtifactError> {
+    let expected = archive_tree_digests(archive, runtime)?;
+    if !expected.contains_key(Path::new(&runtime.executable)) {
+        return Err(ArtifactError::Archive("runtime executable is missing"));
+    }
+    let mut actual = BTreeMap::new();
+    collect_tree_digests(installed, installed, &mut actual)?;
+    if expected != actual {
+        return Err(ArtifactError::Integrity("runtime"));
+    }
+    Ok(())
+}
+
+fn archive_tree_digests(
+    archive: &Path,
+    runtime: &RuntimeArtifact,
+) -> Result<BTreeMap<PathBuf, String>, ArtifactError> {
+    match runtime.archive_format {
+        ArchiveFormat::Zip => zip_tree_digests(archive, &runtime.strip_prefix),
+        ArchiveFormat::TarGz => tar_tree_digests(archive, &runtime.strip_prefix),
+    }
+}
+
+fn zip_tree_digests(
+    archive: &Path,
+    prefix: &str,
+) -> Result<BTreeMap<PathBuf, String>, ArtifactError> {
+    let file = File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|_| ArtifactError::Archive("ZIP rejected"))?;
+    let mut files = BTreeMap::new();
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|_| ArtifactError::Archive("ZIP entry rejected"))?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or(ArtifactError::Archive("ZIP path escapes destination"))?;
+        let Some(relative) = strip_archive_prefix(&enclosed, prefix)? else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        if !entry.is_file() || files.insert(relative, digest_reader(&mut entry)?).is_some() {
+            return Err(ArtifactError::Archive("unsupported or duplicate ZIP entry"));
+        }
+    }
+    Ok(files)
+}
+
+fn tar_tree_digests(
+    archive: &Path,
+    prefix: &str,
+) -> Result<BTreeMap<PathBuf, String>, ArtifactError> {
+    let file = File::open(archive)?;
+    let decoder = GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let entries = tar
+        .entries()
+        .map_err(|_| ArtifactError::Archive("tar rejected"))?;
+    let mut files = BTreeMap::new();
+    let mut links = BTreeMap::<PathBuf, PathBuf>::new();
+    for entry in entries {
+        let mut entry = entry.map_err(|_| ArtifactError::Archive("tar entry rejected"))?;
+        let path = entry
+            .path()
+            .map_err(|_| ArtifactError::Archive("tar path rejected"))?;
+        let Some(relative) = strip_archive_prefix(&path, prefix)? else {
+            continue;
+        };
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            continue;
+        }
+        if entry_type.is_file() {
+            if files.insert(relative, digest_reader(&mut entry)?).is_some() {
+                return Err(ArtifactError::Archive("duplicate tar entry"));
+            }
+        } else if entry_type.is_symlink() {
+            let target = entry
+                .link_name()
+                .map_err(|_| ArtifactError::Archive("tar link rejected"))?
+                .ok_or(ArtifactError::Archive("tar link target missing"))?;
+            if target.is_absolute() || links.insert(relative, target.into_owned()).is_some() {
+                return Err(ArtifactError::Archive("invalid tar link"));
+            }
+        } else {
+            return Err(ArtifactError::Archive("unsupported tar entry type"));
+        }
+    }
+    for link in links.keys() {
+        let source = resolve_link_source(link, &links)?;
+        let digest = files
+            .get(&source)
+            .cloned()
+            .ok_or(ArtifactError::Archive("tar link target is not a file"))?;
+        if files.insert(link.clone(), digest).is_some() {
+            return Err(ArtifactError::Archive("duplicate tar entry"));
+        }
+    }
+    Ok(files)
+}
+
+fn collect_tree_digests(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<PathBuf, String>,
+) -> Result<(), ArtifactError> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ArtifactError::Integrity("runtime"));
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArtifactError::Integrity("runtime"));
+        }
+        if metadata.is_dir() {
+            collect_tree_digests(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| ArtifactError::Integrity("runtime"))?
+                .to_path_buf();
+            if files
+                .insert(relative, digest_reader(BufReader::new(File::open(path)?))?)
+                .is_some()
+            {
+                return Err(ArtifactError::Integrity("runtime"));
+            }
+        } else {
+            return Err(ArtifactError::Integrity("runtime"));
+        }
+    }
+    Ok(())
+}
+
+fn digest_reader(mut reader: impl Read) -> Result<String, ArtifactError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn recover_runtime(
@@ -883,7 +1149,7 @@ mod tests {
 
     use super::{
         ArchiveFormat, ArtifactError, SetupMode, extract_runtime, parse_manifest, safe_relative,
-        select_runtime, setup,
+        select_runtime, setup, verify_runtime_tree,
     };
 
     #[test]
@@ -927,6 +1193,12 @@ mod tests {
         };
         extract_runtime(&runtime, &archive, &destination)?;
         assert_eq!(fs::read(destination.join("llama-server.exe"))?, b"runtime");
+        verify_runtime_tree(&archive, &destination, &runtime)?;
+        fs::write(destination.join("llama-server.exe"), b"modified")?;
+        assert!(matches!(
+            verify_runtime_tree(&archive, &destination, &runtime),
+            Err(ArtifactError::Integrity("runtime"))
+        ));
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -975,6 +1247,7 @@ mod tests {
         };
         extract_runtime(&runtime, &archive, &destination)?;
         assert_eq!(fs::read(destination.join("libllama.so"))?, bytes);
+        verify_runtime_tree(&archive, &destination, &runtime)?;
         fs::remove_dir_all(root)?;
         Ok(())
     }

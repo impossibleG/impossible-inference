@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use impossible_inferences_engine::GenerationEngine;
 use impossible_server_core::{
     CancellationToken, DrainOutcome, HealthRegistry, ProcessState, ReadinessReason, RequestContext,
     RequestIdSource, ServerLimits, ShutdownGate,
@@ -71,6 +72,11 @@ pub trait Workload: Send + Sync + 'static {
     /// Returns workload-specific routes with any private state captured by the implementation.
     fn routes(&self, context: WorkloadContext) -> Router;
 
+    /// Whether the private, transport-neutral generation boundary is available.
+    fn engine_available(&self) -> bool {
+        false
+    }
+
     /// Releases workload resources after HTTP admission has stopped.
     ///
     /// The host polls this future at least once but drops it at the configured shutdown deadline.
@@ -100,6 +106,58 @@ impl Workload for PendingInference {
     }
 }
 
+/// Ready private generation workload. Public generation transports are added separately.
+#[derive(Debug, Clone)]
+pub struct LocalInference {
+    engine: GenerationEngine,
+}
+
+impl LocalInference {
+    /// Wraps a successfully started private generation engine.
+    #[must_use]
+    pub const fn new(engine: GenerationEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl Workload for LocalInference {
+    fn component_name(&self) -> &'static str {
+        "inference-runtime"
+    }
+
+    fn routes(&self, context: WorkloadContext) -> Router {
+        let monitor_engine = self.engine.clone();
+        let monitor_context = context.clone();
+        let terminal = context.shutdown_token();
+        tokio::spawn(async move {
+            loop {
+                monitor_context.set_ready(monitor_engine.status().await.ready);
+                tokio::select! {
+                    () = terminal.cancelled() => {
+                        monitor_context.set_ready(false);
+                        return;
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                }
+            }
+        });
+        Router::new()
+            .route("/status", get(local_status))
+            .route("/v1/models", get(local_models))
+            .with_state(self.engine.clone())
+    }
+
+    fn engine_available(&self) -> bool {
+        true
+    }
+
+    fn shutdown(&self, _force: CancellationToken) -> ShutdownFuture<'_> {
+        Box::pin(async move {
+            let _ = self.engine.shutdown().await;
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct Metrics {
     control_requests: AtomicU64,
@@ -124,6 +182,7 @@ impl Metrics {
 struct AppState {
     health: HealthRegistry,
     metrics: Metrics,
+    engine_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +261,7 @@ impl<W: Workload> InferenceServer<W> {
         let state = Arc::new(AppState {
             health,
             metrics: Metrics::default(),
+            engine_available: workload.engine_available(),
         });
         let middleware_state = WorkloadMiddlewareState {
             limits,
@@ -479,12 +539,47 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> 
 
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     state.metrics.increment();
+    let available: &[&str] = if state.engine_available {
+        &["generation_engine"]
+    } else {
+        &[]
+    };
     Json(serde_json::json!({
         "schema_version": 1,
         "product": "impossible-inferences",
         "version": env!("CARGO_PKG_VERSION"),
-        "available": [],
+        "available": available,
         "pending": ["completions", "chat_completions", "sse", "websocket", "grpc", "mcp"]
+    }))
+}
+
+async fn local_status(State(engine): State<GenerationEngine>) -> Json<serde_json::Value> {
+    let status = engine.status().await;
+    Json(serde_json::json!({
+        "status": if status.ready { "ready" } else { "not_ready" },
+        "runtime": status.runtime,
+        "model": status.model,
+        "profile": status.profile,
+        "ready": status.ready,
+        "public_generation_transports": "pending"
+    }))
+}
+
+async fn local_models(State(engine): State<GenerationEngine>) -> Json<serde_json::Value> {
+    let status = engine.status().await;
+    let data = if status.ready {
+        vec![serde_json::json!({
+            "id": status.profile,
+            "object": "model",
+            "owned_by": "local"
+        })]
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "status": if status.ready { "loaded" } else { "not_ready" }
     }))
 }
 

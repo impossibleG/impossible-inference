@@ -32,6 +32,8 @@ wildcards = "deny"
 highlight = "all"
 deny = []
 skip = [
+    # ring remains on getrandom 0.2 while the engine directly uses the current 0.3 OS API.
+    { name = "getrandom", version = "=0.2.17" },
     # displaydoc and ICU have moved to syn 3 while the remaining proc-macro graph uses syn 2.
     { name = "syn", version = "=3.0.6" },
 ]

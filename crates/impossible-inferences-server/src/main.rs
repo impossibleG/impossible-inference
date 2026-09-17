@@ -9,9 +9,10 @@ use std::{
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use impossible_inferences_artifacts::{SetupMode, Verification, inspect, setup};
-use impossible_inferences_server::{InferenceServer, PendingInference};
+use impossible_inferences_engine::{EngineConfig, EngineStatus, GenerationEngine};
+use impossible_inferences_server::{InferenceServer, LocalInference, PendingInference};
 use impossible_server_core::{CancellationToken, ServerLimits};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -40,7 +41,7 @@ enum Command {
     Setup(SetupArgs),
     /// Start the local HTTP control plane.
     Serve(ConfigArgs),
-    /// Validate effective configuration without opening a listener.
+    /// Fully verify artifacts and probe the private generation engine.
     Doctor(ConfigArgs),
     /// Report the pre-generation runtime and model state.
     Status(ConfigArgs),
@@ -105,6 +106,18 @@ struct EffectiveConfig {
     bind: SocketAddr,
     limits: ServerLimits,
     artifact_root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    artifacts: impossible_inferences_artifacts::InstallStatus,
+    engine: EngineStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    artifacts: impossible_inferences_artifacts::InstallStatus,
+    engine: EngineStatus,
 }
 
 impl ConfigArgs {
@@ -183,19 +196,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(arguments) => serve(arguments.resolve()?).await,
         Command::Doctor(arguments) => {
             let config = arguments.resolve()?;
+            let artifacts = inspect(&config.artifact_root, Verification::Full);
+            let engine = match GenerationEngine::start_from_store(
+                &config.artifact_root,
+                EngineConfig::default(),
+            )
+            .await
+            {
+                Ok(engine) => {
+                    let status = engine.status().await;
+                    let _ = engine.shutdown().await;
+                    status
+                }
+                Err(_) => unavailable_engine_status(),
+            };
             println!(
                 "{}",
-                serde_json::to_string(&inspect(&config.artifact_root, Verification::Full))?
+                serde_json::to_string(&DoctorReport { artifacts, engine })?
             );
             Ok(())
         }
         Command::Status(arguments) => {
+            let artifacts = inspect(&arguments.resolve()?.artifact_root, Verification::Fast);
             println!(
                 "{}",
-                serde_json::to_string(&inspect(
-                    &arguments.resolve()?.artifact_root,
-                    Verification::Fast,
-                ))?
+                serde_json::to_string(&StatusReport {
+                    artifacts,
+                    engine: unavailable_engine_status(),
+                })?
             );
             Ok(())
         }
@@ -211,10 +239,28 @@ async fn serve(config: EffectiveConfig) -> Result<(), Box<dyn std::error::Error>
             let _ = signal.cancel();
         }
     });
-    InferenceServer::with_limits(PendingInference, config.limits)
-        .serve(listener, cancellation)
-        .await?;
+    match GenerationEngine::start_from_store(&config.artifact_root, EngineConfig::default()).await {
+        Ok(engine) => {
+            InferenceServer::with_limits(LocalInference::new(engine), config.limits)
+                .serve(listener, cancellation)
+                .await?;
+        }
+        Err(_) => {
+            InferenceServer::with_limits(PendingInference, config.limits)
+                .serve(listener, cancellation)
+                .await?;
+        }
+    }
     Ok(())
+}
+
+const fn unavailable_engine_status() -> EngineStatus {
+    EngineStatus {
+        ready: false,
+        runtime: "not_running",
+        model: "not_loaded",
+        profile: impossible_inferences_domain::CURATED_MODEL_ID,
+    }
 }
 
 #[cfg(test)]
