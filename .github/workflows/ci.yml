@@ -33,6 +33,10 @@ jobs:
         run: ./scripts/test-privacy-scan.ps1
       - shell: pwsh
         run: ./scripts/verify-foundation-snapshot.ps1
+      - shell: pwsh
+        run: ./scripts/verify-foundation-snapshot.tests.ps1
+      - shell: pwsh
+        run: ./scripts/test-line-endings.ps1
 
   supply-chain:
     runs-on: ubuntu-latest
