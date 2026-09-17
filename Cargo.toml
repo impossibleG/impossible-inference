@@ -15,11 +15,18 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+axum = { version = "=0.8.6", features = ["http1", "json", "tokio"] }
+clap = { version = "=4.5.50", features = ["derive", "env"] }
+http-body-util = "=0.1.3"
 impossible-inferences-domain = { version = "=0.1.0", path = "crates/impossible-inferences-domain" }
 impossible-inferences-protocol = { version = "=0.1.0", path = "crates/impossible-inferences-protocol" }
 impossible-inferences-engine = { version = "=0.1.0", path = "crates/impossible-inferences-engine" }
 impossible-server-core = { version = "=0.1.0", path = "vendor/impossible-server/crates/impossible-server-core" }
 impossible-server-testkit = { version = "=0.1.0", path = "vendor/impossible-server/crates/impossible-server-testkit" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+tokio = "=1.48.0"
+tower = { version = "=0.5.2", features = ["util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

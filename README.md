@@ -12,7 +12,21 @@ non-goals.
 
 ## Current status
 
-Bootstrap only. Do not treat this revision as a functional inference server.
+The bounded control plane is runnable, but token generation is not implemented yet. Do not treat
+this revision as a functional inference server.
+
+```powershell
+cargo run -p impossible-inferences-server -- doctor
+cargo run -p impossible-inferences-server -- status
+cargo run -p impossible-inferences-server -- serve
+```
+
+The server binds to `127.0.0.1:8080` by default and refuses non-loopback addresses. Effective
+configuration precedence is command-line flag, environment variable, optional bounded JSON file,
+then safe default. Run `cargo run -p impossible-inferences-server -- serve --help` for the exact
+variables and limits. The current control plane exposes `/health/live`, `/health/ready`, `/metrics`,
+`/version`, `/v1/capabilities`, `/v1/models`, and `/status`; readiness remains false until a verified
+runtime and model are installed and the generation adapter is healthy.
 
 The repository vendors the reviewed Impossible Server core and testkit as a deterministic source
 snapshot. That snapshot supplies bounded lifecycle, health, request, cancellation, and test
