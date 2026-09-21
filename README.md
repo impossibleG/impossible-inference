@@ -12,6 +12,10 @@ streaming, WebSocket cancellation, unary and streaming gRPC, and bounded MCP too
 The repository is implemented in incremental, buildable commits. See [the v0.1 product
 contract](docs/product-contract.md) for the exact promise and explicit non-goals.
 
+<p align="center">
+  <img src="docs/assets/impossible-inference-scene.png" alt="Structured language fragments forming a local generation stream" width="100%">
+</p>
+
 ## Quickstart
 
 Install the pinned Rust 1.88 toolchain, clone the repository, then run exactly one setup command and
