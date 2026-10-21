@@ -16,6 +16,8 @@ $credentialPatterns = @(
 $safeValue = '(?i)^(?:\$\{[A-Z_][A-Z0-9_]*\}|\$env:[A-Z_][A-Z0-9_]*|<[^>]+>|example|placeholder|dummy|fixture|test|test[-_]?placeholder|change[-_]?me|none|null|redacted|not[-_]?set|x{3,})$'
 $approvedBinaryHashes = @{
     'docs/assets/impossible-inference-header.png' = '67b92799d4f5348920b6281870ad71a73308aacc374f43501037b1097618126f'
+    'docs/assets/impossible-inference-scene.png' = 'd31a7a89de9f65dcda220bd4565a7265a01ac4fa3cc6a08dbaced544a068c6ff'
+    'docs/assets/social-preview.png' = 'a2e411c6cd914151370dc913ce5e4339a560129bf0884ca1b6400e3b903cd32b'
 }
 
 Push-Location $repoRoot
