@@ -9,10 +9,11 @@ service InferenceService {
   rpc ChatStream(ChatRequest) returns (stream GenerationEvent);
 }
 
+// Unset fields use the same defaults as HTTP: max_tokens 256, temperature 0.8, top_p 0.95.
 message Sampling {
-  uint32 max_tokens = 1;
-  float temperature = 2;
-  float top_p = 3;
+  optional uint32 max_tokens = 1;
+  optional float temperature = 2;
+  optional float top_p = 3;
   optional uint32 seed = 4;
   repeated string stop = 5;
 }

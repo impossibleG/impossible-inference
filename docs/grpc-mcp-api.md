@@ -17,7 +17,9 @@ The source contract is
 - `Complete` and `Chat` for unary generation;
 - `CompleteStream` and `ChatStream` for ordered delta, usage, and finish events.
 
-Messages are limited to 1 MiB. Client `grpc-timeout` is honored up to the server's 30-second
+Every `Sampling` field is optional. Unset fields use the HTTP defaults (`max_tokens` 256,
+`temperature` 0.8, `top_p` 0.95), so a request can set only the fields it needs. Messages are
+limited to 1 MiB. Client `grpc-timeout` is honored up to the server's 30-second
 upper bound. Dropping a response stream cancels or safely abandons generation and releases its
 bounded engine lane. The listener also exposes standard gRPC health and v1 reflection. Health is
 `SERVING` only while the local engine reports ready and transitions to `NOT_SERVING` when the

@@ -2749,9 +2749,9 @@ mod tests {
                 model: CURATED_MODEL_ID.to_owned(),
                 prompt: "hello".to_owned(),
                 sampling: Some(Sampling {
-                    max_tokens: 8,
-                    temperature: 0.0,
-                    top_p: 1.0,
+                    max_tokens: Some(8),
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
                     seed: Some(7),
                     stop: Vec::new(),
                 }),
