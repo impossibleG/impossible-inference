@@ -251,7 +251,7 @@ async fn serve(config: EffectiveConfig) -> Result<(), Box<dyn std::error::Error>
     let cancellation = CancellationToken::new();
     let signal = cancellation.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if shutdown_requested().await {
             let _ = signal.cancel();
         }
     });
@@ -289,6 +289,22 @@ async fn serve(config: EffectiveConfig) -> Result<(), Box<dyn std::error::Error>
         }
     }
     Ok(())
+}
+
+/// Waits for Ctrl+C or, on Unix, SIGTERM (`docker stop`, `kill`, service managers).
+///
+/// Returns `false` only when no shutdown signal can be observed.
+async fn shutdown_requested() -> bool {
+    #[cfg(unix)]
+    if let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        return tokio::select! {
+            result = tokio::signal::ctrl_c() => result.is_ok(),
+            received = terminate.recv() => received.is_some(),
+        };
+    }
+    tokio::signal::ctrl_c().await.is_ok()
 }
 
 const fn unavailable_engine_status() -> EngineStatus {
