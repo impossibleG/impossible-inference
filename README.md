@@ -90,7 +90,8 @@ docker run --rm --network host -v impossible-inferences-data:/data impossible-in
 ```
 
 The first `docker run` is setup; the second is serve. Ordinary container startup is offline after
-setup. Bridge-port publishing is intentionally unsupported because the server refuses non-loopback
+setup. `docker stop` (SIGTERM) and Ctrl+C both drain in-flight requests and stop the private runtime
+within the configured shutdown timeout. Bridge-port publishing is intentionally unsupported because the server refuses non-loopback
 binds.
 
 ## License

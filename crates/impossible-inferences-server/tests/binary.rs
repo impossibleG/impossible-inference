@@ -109,3 +109,45 @@ fn real_binary_enforces_public_failures_and_body_deadline() -> Result<(), Box<dy
     assert!(response.contains("deadline_exceeded"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn real_binary_drains_and_exits_cleanly_on_sigterm() -> Result<(), Box<dyn std::error::Error>> {
+    let reservation = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = reservation.local_addr()?.port();
+    drop(reservation);
+    let child = Command::new(env!("CARGO_BIN_EXE_impossible-inferences-server"))
+        .args([
+            "serve",
+            "--bind",
+            &format!("127.0.0.1:{port}"),
+            "--shutdown-timeout-ms",
+            "1000",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    wait_until_live(port)?;
+
+    let status = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()?;
+    assert!(status.success(), "kill -TERM failed: {status}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit = loop {
+        if let Some(exit) = child.0.try_wait()? {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            return Err("server did not exit after SIGTERM".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        exit.success(),
+        "SIGTERM did not trigger graceful shutdown: {exit}"
+    );
+    Ok(())
+}
