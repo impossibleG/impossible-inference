@@ -31,6 +31,8 @@ try {
     if ($LASTEXITCODE -eq 0) {
         throw "foundation verifier accepted altered entries under the old aggregate tree claim"
     }
+    # The rejection above is the expected result; do not report it as this script's exit code.
+    $global:LASTEXITCODE = 0
     Write-Output "Foundation snapshot adversarial mutation was rejected."
 } finally {
     if (Test-Path -LiteralPath $fixture) {

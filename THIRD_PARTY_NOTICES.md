@@ -14,7 +14,6 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `anstyle-query` | 1.1.5 | `MIT OR Apache-2.0` | crates.io |
 | `anstyle-wincon` | 3.0.11 | `MIT OR Apache-2.0` | crates.io |
 | `anyhow` | 1.0.104 | `MIT OR Apache-2.0` | crates.io |
-| `arbitrary` | 1.4.2 | `MIT OR Apache-2.0` | crates.io |
 | `async-trait` | 0.1.92 | `MIT OR Apache-2.0` | crates.io |
 | `atomic-waker` | 1.1.2 | `Apache-2.0 OR MIT` | crates.io |
 | `axum` | 0.8.6 | `MIT` | crates.io |
@@ -38,7 +37,6 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `crc32fast` | 1.5.2 | `MIT OR Apache-2.0` | crates.io |
 | `crypto-common` | 0.1.7 | `MIT OR Apache-2.0` | crates.io |
 | `data-encoding` | 2.11.1 | `MIT` | crates.io |
-| `derive_arbitrary` | 1.4.2 | `MIT OR Apache-2.0` | crates.io |
 | `digest` | 0.10.7 | `MIT OR Apache-2.0` | crates.io |
 | `displaydoc` | 0.2.7 | `MIT OR Apache-2.0` | crates.io |
 | `either` | 1.18.0 | `MIT OR Apache-2.0` | crates.io |
@@ -105,6 +103,7 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `miniz_oxide` | 0.8.9 | `MIT OR Zlib OR Apache-2.0` | crates.io |
 | `mio` | 1.2.3 | `MIT` | crates.io |
 | `multimap` | 0.10.1 | `MIT OR Apache-2.0` | crates.io |
+| `nix` | 0.31.3 | `MIT` | crates.io |
 | `once_cell` | 1.21.4 | `MIT OR Apache-2.0` | crates.io |
 | `once_cell_polyfill` | 1.70.2 | `MIT OR Apache-2.0` | crates.io |
 | `percent-encoding` | 2.3.2 | `MIT OR Apache-2.0` | crates.io |
@@ -150,9 +149,9 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `ring` | 0.17.14 | `Apache-2.0 AND ISC` | crates.io |
 | `rustc-hash` | 2.1.3 | `Apache-2.0 OR MIT` | crates.io |
 | `rustix` | 1.1.5 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | crates.io |
-| `rustls` | 0.23.45 | `Apache-2.0 OR ISC OR MIT` | crates.io |
+| `rustls` | 0.23.46 | `Apache-2.0 OR ISC OR MIT` | crates.io |
 | `rustls-pki-types` | 1.15.1 | `MIT OR Apache-2.0` | crates.io |
-| `rustls-webpki` | 0.103.15 | `ISC` | crates.io |
+| `rustls-webpki` | 0.103.16 | `ISC` | crates.io |
 | `rustversion` | 1.0.23 | `MIT OR Apache-2.0` | crates.io |
 | `ryu` | 1.0.23 | `Apache-2.0 OR BSL-1.0` | crates.io |
 | `serde` | 1.0.228 | `MIT OR Apache-2.0` | crates.io |
@@ -203,6 +202,7 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `tracing-core` | 0.1.36 | `MIT` | crates.io |
 | `try-lock` | 0.2.5 | `MIT` | crates.io |
 | `tungstenite` | 0.28.0 | `MIT OR Apache-2.0` | crates.io |
+| `typed-path` | 0.12.4 | `MIT OR Apache-2.0` | crates.io |
 | `typenum` | 1.20.1 | `MIT OR Apache-2.0` | crates.io |
 | `unicase` | 2.9.0 | `MIT OR Apache-2.0` | crates.io |
 | `unicode-ident` | 1.0.26 | `(MIT OR Apache-2.0) AND Unicode-3.0` | crates.io |
@@ -223,7 +223,7 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `wasm-streams` | 0.4.2 | `MIT OR Apache-2.0` | crates.io |
 | `web-sys` | 0.3.105 | `MIT OR Apache-2.0` | crates.io |
 | `web-time` | 1.1.0 | `MIT OR Apache-2.0` | crates.io |
-| `webpki-roots` | 1.0.9 | `CDLA-Permissive-2.0` | crates.io |
+| `webpki-roots` | 1.0.10 | `CDLA-Permissive-2.0` | crates.io |
 | `winapi` | 0.3.9 | `MIT/Apache-2.0` | crates.io |
 | `winapi-i686-pc-windows-gnu` | 0.4.0 | `MIT/Apache-2.0` | crates.io |
 | `winapi-x86_64-pc-windows-gnu` | 0.4.0 | `MIT/Apache-2.0` | crates.io |
@@ -252,6 +252,6 @@ Impossible Inference is distributed under MIT OR Apache-2.0. The inventory below
 | `zerotrie` | 0.2.5 | `Unicode-3.0` | crates.io |
 | `zerovec` | 0.11.8 | `Unicode-3.0` | crates.io |
 | `zerovec-derive` | 0.11.6 | `Unicode-3.0` | crates.io |
-| `zip` | 6.0.0 | `MIT` | crates.io |
+| `zip` | 9.0.5 | `MIT` | crates.io |
 | `zlib-rs` | 0.6.8 | `Zlib` | crates.io |
 | `zopfli` | 0.8.3 | `Apache-2.0` | crates.io |

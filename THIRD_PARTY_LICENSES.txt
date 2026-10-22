@@ -55,12 +55,6 @@ UPSTREAM: https://github.com/dtolnay/anyhow
 TEXT: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a [crate] LICENSE-APACHE
 TEXT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3 [crate] LICENSE-MIT
 
-PACKAGE: arbitrary 1.4.2
-DECLARED-LICENSE: MIT OR Apache-2.0
-UPSTREAM: https://github.com/rust-fuzz/arbitrary/
-TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
-TEXT: 15656cc11a8331f28c0986b8ab97220d3e76f98e60ed388b5ffad37dfac4710c [crate] LICENSE-MIT
-
 PACKAGE: async-trait 0.1.92
 DECLARED-LICENSE: MIT OR Apache-2.0
 UPSTREAM: https://github.com/dtolnay/async-trait
@@ -194,12 +188,6 @@ PACKAGE: data-encoding 2.11.1
 DECLARED-LICENSE: MIT
 UPSTREAM: https://github.com/ia0/data-encoding
 TEXT: b68ad1a3367b825447089e1f8d6829b97f47a89eb78d2f4ebaef4672f5606186 [crate] LICENSE
-
-PACKAGE: derive_arbitrary 1.4.2
-DECLARED-LICENSE: MIT OR Apache-2.0
-UPSTREAM: https://github.com/rust-fuzz/arbitrary
-TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
-TEXT: 15656cc11a8331f28c0986b8ab97220d3e76f98e60ed388b5ffad37dfac4710c [crate] LICENSE-MIT
 
 PACKAGE: digest 0.10.7
 DECLARED-LICENSE: MIT OR Apache-2.0
@@ -586,6 +574,11 @@ UPSTREAM: https://github.com/havarnov/multimap
 TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
 TEXT: 23ce717d2face34a1ae9af6a8c8fbbf488875afee16374d7a10ce79d41e22f37 [crate] LICENSE-MIT
 
+PACKAGE: nix 0.31.3
+DECLARED-LICENSE: MIT
+UPSTREAM: https://github.com/nix-rust/nix
+TEXT: 66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70 [crate] LICENSE
+
 PACKAGE: once_cell 1.21.4
 DECLARED-LICENSE: MIT OR Apache-2.0
 UPSTREAM: https://github.com/matklad/once_cell
@@ -847,7 +840,7 @@ TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] L
 TEXT: a6c48161a09acc75a0e25503bab66a731eb5fba5392ed4bb4743e4ba5085327a [crate] LICENSE-Apache-2.0_WITH_LLVM-exception
 TEXT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3 [crate] LICENSE-MIT
 
-PACKAGE: rustls 0.23.45
+PACKAGE: rustls 0.23.46
 DECLARED-LICENSE: Apache-2.0 OR ISC OR MIT
 UPSTREAM: https://github.com/rustls/rustls
 TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
@@ -860,7 +853,7 @@ UPSTREAM: https://github.com/rustls/pki-types
 TEXT: 45fd05c4865e7c350b98ad7ac50e1b15462d49af4a91e9b0c9dd933dc9a69742 [crate] LICENSE-APACHE
 TEXT: 9117d922e667125508dde62b02c1f57ed22f5ad21eb536aa2e2d99e1c796e639 [crate] LICENSE-MIT
 
-PACKAGE: rustls-webpki 0.103.15
+PACKAGE: rustls-webpki 0.103.16
 DECLARED-LICENSE: ISC
 UPSTREAM: https://github.com/rustls/webpki
 TEXT: 5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a [crate] LICENSE
@@ -1140,6 +1133,12 @@ UPSTREAM: https://github.com/snapview/tungstenite-rs
 TEXT: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2 [crate] LICENSE-APACHE
 TEXT: 7fea0ee51a4ca5d5cea7464135fd55e8b09caf3a61da3d451ac8a22af95c033f [crate] LICENSE-MIT
 
+PACKAGE: typed-path 0.12.4
+DECLARED-LICENSE: MIT OR Apache-2.0
+UPSTREAM: https://github.com/chipsenkbeil/typed-path
+TEXT: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a [crate] LICENSE-APACHE
+TEXT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3 [crate] LICENSE-MIT
+
 PACKAGE: typenum 1.20.1
 DECLARED-LICENSE: MIT OR Apache-2.0
 UPSTREAM: https://github.com/paholg/typenum
@@ -1263,7 +1262,7 @@ UPSTREAM: https://github.com/daxpedda/web-time
 TEXT: 54a744942eb3fa63a74d8d359989ed6962c04f3f10ff20cfa08ff8aa7efbe4e6 [crate] LICENSE-APACHE
 TEXT: f428305bbf2e70fbd807af0f3c7ac1b7acfb95311640f451e9d2e48db6d7e96b [crate] LICENSE-MIT
 
-PACKAGE: webpki-roots 1.0.9
+PACKAGE: webpki-roots 1.0.10
 DECLARED-LICENSE: CDLA-Permissive-2.0
 UPSTREAM: https://github.com/rustls/webpki-roots
 TEXT: e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8 [crate] LICENSE
@@ -1431,10 +1430,10 @@ DECLARED-LICENSE: Unicode-3.0
 UPSTREAM: https://github.com/unicode-org/icu4x
 TEXT: f367c1b8e1aa262435251e442901da4607b4650e0e63a026f5044473ecfb90f2 [crate] LICENSE
 
-PACKAGE: zip 6.0.0
+PACKAGE: zip 9.0.5
 DECLARED-LICENSE: MIT
-UPSTREAM: https://github.com/zip-rs/zip2.git
-TEXT: 13f16f8435b4242f494f038d761bd99c5af70395aa39274bd287d22c4d35c3b7 [crate] LICENSE
+UPSTREAM: https://github.com/zip-rs/zip2
+TEXT: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79 [crate] LICENSE
 
 PACKAGE: zlib-rs 0.6.8
 DECLARED-LICENSE: Zlib
@@ -2551,34 +2550,6 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
-TEXT-SHA256: 13f16f8435b4242f494f038d761bd99c5af70395aa39274bd287d22c4d35c3b7
---------------------------------------------------------------------------------
-The MIT License (MIT)
-
-Copyright (c) 2014 Mathijs van de Nes
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-Some files in the "tests/data" subdirectory of this repository are under other
-licences; see files named LICENSE.*.txt for details.
-
---------------------------------------------------------------------------------
 TEXT-SHA256: 1466d9b4f3a59bb8997fc8d5fa977ce3f6a24bb2358793c09bfdf007039f6486
 --------------------------------------------------------------------------------
 Copyright (c) 2024 The lru-slab Developers
@@ -2793,37 +2764,6 @@ TEXT-SHA256: 1520f0253bb05bbfc841b827fe6440172f0513b4a890f720c9de1665a07c21e8
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-
---------------------------------------------------------------------------------
-TEXT-SHA256: 15656cc11a8331f28c0986b8ab97220d3e76f98e60ed388b5ffad37dfac4710c
---------------------------------------------------------------------------------
-MIT License
-
-Copyright (c) 2019 Manish Goregaokar
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 TEXT-SHA256: 1626f2c950cee975b5809748e288468141d09aa420314c7c9b35e6e62b772b2d
@@ -5181,6 +5121,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 --------------------------------------------------------------------------------
+TEXT-SHA256: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79
+--------------------------------------------------------------------------------
+The MIT License (MIT)
+
+Copyright (c) 2014 Mathijs van de Nes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
 TEXT-SHA256: 5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a
 --------------------------------------------------------------------------------
 Except as otherwise noted, this project is licensed under the following
@@ -5573,6 +5538,31 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+TEXT-SHA256: 66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70
+--------------------------------------------------------------------------------
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 TEXT-SHA256: 6a13bc24a100a6812f053879ec51b126b103af7cda6dbf48c4188722da44da9f
