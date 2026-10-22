@@ -254,21 +254,15 @@ fn chat_request(request: ChatRequest) -> Result<GenerationRequest, Status> {
 }
 
 fn sampling(sampling: Option<Sampling>) -> GenerationRequest {
-    let sampling = sampling.unwrap_or(Sampling {
-        max_tokens: DEFAULT_MAX_TOKENS,
-        temperature: DEFAULT_TEMPERATURE,
-        top_p: DEFAULT_TOP_P,
-        seed: None,
-        stop: Vec::new(),
-    });
+    let sampling = sampling.unwrap_or_default();
     GenerationRequest {
         model: String::new(),
         input: GenerationInput::Completion {
             prompt: String::new(),
         },
-        max_tokens: sampling.max_tokens,
-        temperature: sampling.temperature,
-        top_p: sampling.top_p,
+        max_tokens: sampling.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        temperature: sampling.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        top_p: sampling.top_p.unwrap_or(DEFAULT_TOP_P),
         seed: sampling.seed,
         stop: sampling.stop,
     }
@@ -424,5 +418,35 @@ async fn publish_health(reporter: &mut tonic_health::server::HealthReporter, rea
         reporter
             .set_not_serving::<InferenceServiceServer<GrpcInference>>()
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, Sampling, sampling};
+
+    #[test]
+    fn partial_sampling_keeps_defaults_for_unset_fields() {
+        let partial = sampling(Some(Sampling {
+            max_tokens: Some(32),
+            seed: Some(7),
+            ..Sampling::default()
+        }));
+        assert_eq!(partial.max_tokens, 32);
+        assert!((partial.temperature - DEFAULT_TEMPERATURE).abs() < f32::EPSILON);
+        assert!((partial.top_p - DEFAULT_TOP_P).abs() < f32::EPSILON);
+        assert_eq!(partial.seed, Some(7));
+
+        let greedy = sampling(Some(Sampling {
+            temperature: Some(0.0),
+            ..Sampling::default()
+        }));
+        assert_eq!(greedy.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!(greedy.temperature.abs() < f32::EPSILON);
+        assert!((greedy.top_p - DEFAULT_TOP_P).abs() < f32::EPSILON);
+
+        let absent = sampling(None);
+        assert_eq!(absent.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!((absent.top_p - DEFAULT_TOP_P).abs() < f32::EPSILON);
     }
 }
