@@ -31,6 +31,9 @@ try {
         $env:USERPROFILE,
         $env:HOME
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 }
+    # `git config --get` exits 1 when a key is unset (as on CI runners). That is an expected empty
+    # marker, not a scan failure, so it must not leak out as this script's exit code.
+    $global:LASTEXITCODE = 0
     $findings = [Collections.Generic.List[string]]::new()
     foreach ($file in $files) {
         $normalized = $file.Replace('\', '/')
